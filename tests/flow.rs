@@ -548,8 +548,8 @@ fn a_second_process_on_the_same_state_is_locked_out() {
     assert_eq!(env.issuer.invoices_created(), 0);
 
     drop(held);
-    // Other tests in this binary spawn processes at the same time, which can briefly delay
-    // the release seen here; wait for it within a bound instead of asserting at once.
+    // Lock reacquisition failed intermittently during parallel test runs.
+    // Retry only Locked within a fixed bound; other errors fail immediately.
     let start = Instant::now();
     loop {
         match Bridge::open(env.cfg.clone()) {
