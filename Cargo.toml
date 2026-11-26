@@ -1,0 +1,24 @@
+[package]
+name = "paid-stream-bridge"
+version = "0.1.0"
+edition = "2021"
+# `std::fs::File::try_lock` is stable from 1.89.
+rust-version = "1.89"
+publish = false
+description = "Prototype CLI bridge for Zakura paid streams. Simulation only: mock node and mock issuer, no wallet, no payment."
+
+[dependencies]
+# Issuer signatures on invoices and grants (verify_strict).
+ed25519-dalek = "2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The ZIP 321 reference parser, used to read back every payment request the bridge builds.
+zip321 = "0.10"
+# Address parsing and network checks; the versions zip321 0.10 itself depends on.
+zcash_address = "0.14"
+zcash_protocol = "0.11"
+# Already a dependency of zip321; used for base64url memos and the HTTP Basic cookie header.
+base64 = "0.22"
+
+[profile.dev]
+debug = 0
