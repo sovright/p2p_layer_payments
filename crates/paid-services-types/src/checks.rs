@@ -1,6 +1,6 @@
 //! What the bridge checks before it shows a payment request or installs a grant.
 
-use crate::codec::{Grant, Invoice, Network};
+use crate::codec::{Entitlement, Grant, Invoice, Network, Terms};
 use crate::uri;
 
 /// Values the bridge trusts: its own configuration and the node's own NodeId.
@@ -89,11 +89,13 @@ fn check_parties(
     Ok(())
 }
 
-/// Runs on an invoice whose signature already verified against the pinned key.
+/// Runs on an invoice whose signature already verified against the pinned key. The service
+/// adapter checks the service-specific parts separately.
 pub fn check_invoice(
     inv: &Invoice,
     exp: &Expectations,
-    service: &str,
+    service_kind: &str,
+    offer_id: &str,
     purchase_id: &[u8; 16],
     limit_zat: u64,
 ) -> Result<(), CheckError> {
@@ -104,10 +106,10 @@ pub fn check_invoice(
         &inv.client_node_id,
         exp,
     )?;
-    if inv.service != service {
+    if inv.service_kind != service_kind || inv.offer_id != offer_id {
         return Err(CheckError::Service {
-            expected: service.to_string(),
-            got: inv.service.clone(),
+            expected: format!("{service_kind} {offer_id}"),
+            got: format!("{} {}", inv.service_kind, inv.offer_id),
         });
     }
     if &inv.purchase_id != purchase_id {
@@ -125,11 +127,15 @@ pub fn check_invoice(
     if inv.deadline_height == 0 {
         return Err(CheckError::Terms("deadline height is zero"));
     }
-    if inv.access_blocks == 0 {
-        return Err(CheckError::Terms("access duration is zero"));
-    }
     if inv.confirmations == 0 {
         return Err(CheckError::Terms("confirmation count is zero"));
+    }
+    match inv.terms {
+        Terms::HeightWindow { blocks: 0 } => {
+            return Err(CheckError::Terms("access duration is zero"))
+        }
+        Terms::Quota { units: 0 } => return Err(CheckError::Terms("quota is zero")),
+        _ => {}
     }
     uri::check_destination(&inv.destination, exp.network).map_err(CheckError::Destination)?;
     let request = uri::build_payment_uri(inv);
@@ -146,24 +152,45 @@ pub fn check_grant(grant: &Grant, inv: &Invoice, exp: &Expectations) -> Result<(
         &grant.client_node_id,
         exp,
     )?;
-    if grant.service != inv.service {
-        return Err(CheckError::GrantMismatch("service"));
+    if grant.service_kind != inv.service_kind {
+        return Err(CheckError::GrantMismatch("service_kind"));
+    }
+    if grant.offer_id != inv.offer_id {
+        return Err(CheckError::GrantMismatch("offer_id"));
     }
     if grant.purchase_id != inv.purchase_id {
         return Err(CheckError::GrantMismatch("purchase_id"));
     }
-    if grant.end_height <= grant.start_height {
-        return Err(CheckError::GrantMismatch(
-            "end height is not above start height",
-        ));
+    if grant.service_params != inv.service_params {
+        return Err(CheckError::GrantMismatch("service_params"));
     }
-    if grant.end_height - grant.start_height != inv.access_blocks {
-        return Err(CheckError::GrantMismatch(
-            "duration differs from the quoted access",
-        ));
-    }
-    if grant.session_allowance == 0 {
-        return Err(CheckError::GrantMismatch("session allowance is zero"));
+    match (inv.terms, grant.entitlement) {
+        (
+            Terms::HeightWindow { blocks },
+            Entitlement::HeightWindow {
+                start_height,
+                end_height,
+            },
+        ) => {
+            if end_height.checked_sub(start_height) != Some(blocks) {
+                return Err(CheckError::GrantMismatch(
+                    "the height window differs from the quoted access",
+                ));
+            }
+        }
+        (Terms::Quota { units }, Entitlement::Quota { units: granted }) => {
+            if units != granted {
+                return Err(CheckError::GrantMismatch(
+                    "the quota differs from the quoted one",
+                ));
+            }
+        }
+        (Terms::OneShot, Entitlement::OneShot) => {}
+        _ => {
+            return Err(CheckError::GrantMismatch(
+                "the entitlement does not match the terms",
+            ))
+        }
     }
     Ok(())
 }

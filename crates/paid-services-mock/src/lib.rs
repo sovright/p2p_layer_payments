@@ -1,6 +1,6 @@
 //! Mock node and mock issuer for the simulation.
 //!
-//! The mock node serves the proposed `paidstream_*` contracts on loopback with cookie
+//! The mock node serves the proposed `paidsvc_*` contracts on loopback with cookie
 //! authentication. They are proposals, not Zakura RPCs. Its client identity is a configured
 //! value standing in for the TLS-proven NodeId of a real P2P session, so a `NotFound` for
 //! another NodeId tests this mock contract only, not real P2P authentication. A mock
@@ -21,11 +21,13 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use zcash_address::unified::{self, Encoding as _};
 
+use paid_services_relay::{RelayParams, SERVICE_KIND as RELAY};
 use paid_services_types::codec::{
-    self, Grant, Invoice, Network, SigningKey, VerificationKey, GRANT_DOMAIN, INVOICE_DOMAIN,
-    SIGNATURE_LEN,
+    self, Entitlement, Grant, Invoice, Network, SigningKey, Terms, VerificationKey, GRANT_DOMAIN,
+    INVOICE_DOMAIN, SIGNATURE_LEN,
 };
 use paid_services_types::expiry::LIBRUSTZCASH_DEFAULT;
+use paid_services_types::rpc;
 use paid_services_types::{hex_array, hex_bytes};
 
 use crate::http::{read_http_message, write_http_response};
@@ -45,15 +47,35 @@ pub const OTHER_CLIENT_NODE_ID: [u8; 32] = [0xc2; 32];
 
 pub use paid_services_types::contract::{CODE_INVALID_GRANT, CODE_MOCK_CONTROL, CODE_REJECTED};
 
-/// A service the mock issuer sells (test data).
+/// An offer the mock issuer sells (test data).
 #[derive(Clone, Debug)]
-pub struct MockService {
-    /// Service name.
-    pub name: String,
+pub struct MockOffer {
+    /// The versioned service kind.
+    pub service_kind: String,
+    /// The offer id.
+    pub offer_id: String,
     /// Price in zatoshis.
     pub price_zat: u64,
-    /// Access length in blocks.
-    pub access_blocks: u32,
+    /// What the offer sells.
+    pub terms: Terms,
+    /// The service's parameters.
+    pub service_params: Vec<u8>,
+}
+
+impl MockOffer {
+    /// A relay-stream offer of `blocks` blocks with one session (test data).
+    pub fn relay(offer_id: &str, price_zat: u64, blocks: u32) -> Self {
+        MockOffer {
+            service_kind: RELAY.into(),
+            offer_id: offer_id.into(),
+            price_zat,
+            terms: Terms::HeightWindow { blocks },
+            service_params: RelayParams {
+                session_allowance: 1,
+            }
+            .encode(),
+        }
+    }
 }
 
 /// Test data for the mock issuer.
@@ -67,10 +89,8 @@ pub struct MockParams {
     pub deadline_margin: u32,
     /// Confirmations before a grant.
     pub confirmations: u32,
-    /// Sessions a grant allows.
-    pub session_allowance: u32,
-    /// Services on sale.
-    pub services: Vec<MockService>,
+    /// Offers on sale.
+    pub offers: Vec<MockOffer>,
 }
 
 impl Default for MockParams {
@@ -80,18 +100,9 @@ impl Default for MockParams {
             start_tip: 4_500_000,
             deadline_margin: 150,
             confirmations: 3,
-            session_allowance: 1,
-            services: vec![
-                MockService {
-                    name: "synthetic-10".into(),
-                    price_zat: 25_000,
-                    access_blocks: 10,
-                },
-                MockService {
-                    name: "synthetic-20".into(),
-                    price_zat: 40_000,
-                    access_blocks: 20,
-                },
+            offers: vec![
+                MockOffer::relay("relay-10", 25_000, 10),
+                MockOffer::relay("relay-20", 40_000, 20),
             ],
         }
     }
@@ -184,7 +195,7 @@ impl MockError {
     }
 }
 
-/// What `paidstream_getgrant` reports, following the proposal's status table.
+/// What `paidsvc_getgrant` reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MockStatus {
     /// Unknown, or bound to another client.
@@ -217,7 +228,7 @@ impl MockStatus {
         }
     }
 
-    /// The `paidstream_getgrant` answer.
+    /// The `paidsvc_getgrant` answer.
     pub fn to_json(&self) -> Value {
         match self {
             MockStatus::Issued(g) | MockStatus::Expired(Some(g)) => {
@@ -255,7 +266,6 @@ impl IssuerState {
     fn issue_due(&mut self) {
         let tip = self.tip;
         let n = self.params.confirmations;
-        let allowance = self.params.session_allowance;
         for (i, r) in self.records.iter_mut().enumerate() {
             if r.grant.is_some() {
                 continue;
@@ -274,12 +284,19 @@ impl IssuerState {
                 issuer_key: r.invoice.issuer_key,
                 provider_node_id: r.invoice.provider_node_id,
                 client_node_id: r.invoice.client_node_id,
-                service: r.invoice.service.clone(),
+                service_kind: r.invoice.service_kind.clone(),
+                offer_id: r.invoice.offer_id.clone(),
                 purchase_id: r.invoice.purchase_id,
                 grant_id,
-                start_height: tip,
-                end_height: tip + r.invoice.access_blocks,
-                session_allowance: allowance,
+                entitlement: match r.invoice.terms {
+                    Terms::HeightWindow { blocks } => Entitlement::HeightWindow {
+                        start_height: tip,
+                        end_height: tip.saturating_add(blocks),
+                    },
+                    Terms::Quota { units } => Entitlement::Quota { units },
+                    Terms::OneShot => Entitlement::OneShot,
+                },
+                service_params: r.invoice.service_params.clone(),
             };
             let bytes = codec::sign_grant(&grant, &self.key).expect("mock grant encodes");
             r.grant = Some((grant, bytes));
@@ -288,7 +305,11 @@ impl IssuerState {
 
     fn status(&self, r: &Record) -> MockStatus {
         if let Some((grant, bytes)) = &r.grant {
-            return if self.tip >= grant.end_height {
+            let ended = matches!(
+                grant.entitlement,
+                Entitlement::HeightWindow { end_height, .. } if self.tip >= end_height
+            );
+            return if ended {
                 MockStatus::Expired(Some(bytes.clone()))
             } else {
                 MockStatus::Issued(bytes.clone())
@@ -379,24 +400,25 @@ impl MockIssuer {
     pub fn request_invoice(
         &self,
         client: [u8; 32],
-        service: &str,
+        service_kind: &str,
+        offer_id: &str,
         request_id: [u8; 16],
     ) -> Result<([u8; 16], Vec<u8>), MockError> {
         let mut s = self.lock();
         if let Some(&i) = s.by_request.get(&(client, request_id)) {
             let r = &s.records[i];
-            if r.invoice.service != service {
+            if r.invoice.service_kind != service_kind || r.invoice.offer_id != offer_id {
                 return Err(MockError::RequestConflict);
             }
             return Ok((r.invoice.purchase_id, r.invoice_bytes.clone()));
         }
         let offer = s
             .params
-            .services
+            .offers
             .iter()
-            .find(|o| o.name == service)
+            .find(|o| o.service_kind == service_kind && o.offer_id == offer_id)
             .cloned()
-            .ok_or_else(|| MockError::UnknownService(service.to_string()))?;
+            .ok_or_else(|| MockError::UnknownService(format!("{service_kind} {offer_id}")))?;
         let index = s.records.len() as u64;
         let mut purchase_id = *b"mockpid:\0\0\0\0\0\0\0\0";
         purchase_id[8..].copy_from_slice(&index.to_be_bytes());
@@ -405,14 +427,16 @@ impl MockIssuer {
             issuer_key: codec::public_key_bytes(&s.key),
             provider_node_id: TEST_PROVIDER_NODE_ID,
             client_node_id: client,
-            service: service.to_string(),
+            service_kind: service_kind.to_string(),
+            offer_id: offer_id.to_string(),
             purchase_id,
             amount_zat: offer.price_zat,
             destination: mock_destination(s.params.network, index),
             memo: format!("psb-mock {}", hex::encode(purchase_id)).into_bytes(),
             deadline_height: s.tip + s.params.deadline_margin,
-            access_blocks: offer.access_blocks,
             confirmations: s.params.confirmations,
+            terms: offer.terms,
+            service_params: offer.service_params,
         };
         let invoice_bytes = codec::sign_invoice(&invoice, &s.key).map_err(MockError::Encode)?;
         s.records.push(Record {
@@ -677,12 +701,13 @@ impl MockNode {
         match method {
             "getminermeshinfo" => Ok(json!({"node_id": hex::encode(node_id), "simulated": true})),
             "getblockcount" => Ok(json!(self.issuer.tip())),
-            "paidstream_requestinvoice" => {
-                let service = str_param("service")?;
+            rpc::REQUEST_INVOICE => {
+                let service_kind = str_param("service_kind")?;
+                let offer_id = str_param("offer_id")?;
                 let request_id = hex16("request_id")?;
                 let (purchase_id, bytes) = self
                     .issuer
-                    .request_invoice(node_id, &service, request_id)
+                    .request_invoice(node_id, &service_kind, &offer_id, request_id)
                     .map_err(|e| (e.code(), e.message()))?;
                 if self.lock().tamper == Tamper::MalformedInvoiceAnswer {
                     // The provider recorded the request; the answer arrives garbled.
@@ -693,12 +718,12 @@ impl MockNode {
                 let bytes = self.tamper_invoice(bytes);
                 Ok(json!({"purchase_id": hex::encode(purchase_id), "invoice": hex::encode(&bytes)}))
             }
-            "paidstream_getgrant" => {
+            rpc::GET_GRANT => {
                 let purchase_id = hex16("purchase_id")?;
                 let status = self.issuer.get_grant(node_id, purchase_id);
                 Ok(self.tamper_status(status))
             }
-            "paidstream_setgrant" => self.set_grant(&str_param("grant")?),
+            rpc::INSTALL_GRANT => self.set_grant(&str_param("grant")?),
             "mock_pay" | "mock_mine" | "mock_drop_next" | "mock_tamper"
                 if !self.lock().controls =>
             {
@@ -757,8 +782,14 @@ impl MockNode {
                 "grant is bound to another NodeId than this node's".into(),
             ));
         }
-        if grant.end_height <= grant.start_height {
-            return Err(invalid("grant has an empty validity range".into()));
+        if let Entitlement::HeightWindow {
+            start_height,
+            end_height,
+        } = grant.entitlement
+        {
+            if end_height <= start_height {
+                return Err(invalid("grant has an empty validity range".into()));
+            }
         }
         match s.installed.get(&grant.purchase_id) {
             Some(existing) if existing != &bytes => {
@@ -771,8 +802,7 @@ impl MockNode {
         s.installed.insert(grant.purchase_id, bytes);
         Ok(json!({
             "installed": true,
-            "start_height": grant.start_height,
-            "end_height": grant.end_height,
+            "grant_id": hex::encode(grant.grant_id),
             "simulated": true,
             "note": "mock install; no stream is consumed"
         }))
@@ -799,7 +829,7 @@ impl MockNode {
             Tamper::InvoiceWrongNetwork => resign(&|i| i.network = Network::Main),
             Tamper::InvoiceWrongProvider => resign(&|i| i.provider_node_id = [0x51; 32]),
             Tamper::InvoiceWrongClient => resign(&|i| i.client_node_id = OTHER_CLIENT_NODE_ID),
-            Tamper::InvoiceWrongService => resign(&|i| i.service = "synthetic-20".into()),
+            Tamper::InvoiceWrongService => resign(&|i| i.offer_id = "relay-20".into()),
             _ => bytes,
         }
     }

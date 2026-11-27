@@ -1,31 +1,53 @@
-//! The bridge: buy, status, resume and show.
+//! The sidecar's purchase lifecycle: buy, status, resume and show.
 //!
-//! The bridge holds no keys and builds no transactions. It takes access decisions only from
-//! issuer-signed objects that verify against its pinned issuer key. A signed grant is the
-//! trusted issuer's access authorization, not on-chain proof of payment; the bridge never
-//! derives a grant or a payment from a local txid, a user statement or the node's chain RPC.
+//! The sidecar holds no wallet spending keys and builds no transactions. It takes access
+//! decisions only from issuer-signed objects that verify against its pinned issuer key. A
+//! signed grant is the trusted issuer's access authorization, not on-chain proof of payment;
+//! the sidecar never derives a grant or a payment from a local txid, a user statement or the
+//! node's chain RPC.
+//!
+//! The lifecycle is the same for every service. A [`ServiceAdapter`] adds only what is
+//! specific to a service kind: which terms it sells, its `service_params`, and how a grant is
+//! redeemed.
 
 use std::path::Path;
 
+use paid_services_relay::RelayAdapter;
 use paid_services_types::checks::{self, Expectations};
-use paid_services_types::codec::{self, Invoice, VerificationKey};
+use paid_services_types::codec::{self, Entitlement, Invoice, VerificationKey};
 use paid_services_types::contract;
 use paid_services_types::expiry::{self, WalletExpiryProfile};
+use paid_services_types::rpc::{
+    self, GetGrantParams, GetGrantResult, InstallGrantParams, InstallGrantResult, PurchaseStatus,
+    RequestInvoiceParams, RequestInvoiceResult,
+};
+use paid_services_types::service::{Redemption, ServiceAdapter};
 use paid_services_types::{hex_array, hex_bytes, uri};
 use rand_core::{OsRng, RngCore};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::rpc::{RpcClient, RpcError};
-use crate::state::{Install, Purchase, Stage, StateError, StateFile, StateStore};
+use crate::state::{Purchase, Stage, StateError, StateFile, StateStore};
 
 /// The sidecar configuration (see [`paid_services_types::config::SidecarConfig`]).
 pub use paid_services_types::config::SidecarConfig as Config;
 
 /// Printed by every command: what this prototype is not.
 pub const SIMULATION_NOTICE: &str = "SIMULATION ONLY: this prototype talks to a mock node and a mock issuer. \
-No wallet, no Zakura node and no payment are involved. paidstream_* are proposed RPC contracts, not existing \
+No wallet, no Zakura node and no payment are involved. paidsvc_* are proposed RPC contracts, not existing \
 Zakura RPCs, and a mock install does not show that a node consumes a stream. Do not open a printed payment \
 request in a wallet: wallet expiry support is not solved.";
+
+/// The service adapters this sidecar knows. The relay stream is the only one so far.
+pub fn adapter_for(service_kind: &str) -> Option<&'static dyn ServiceAdapter> {
+    static RELAY: RelayAdapter = RelayAdapter;
+    let adapters: [&'static dyn ServiceAdapter; 1] = [&RELAY];
+    adapters
+        .into_iter()
+        .find(|a| a.service_kind() == service_kind)
+}
 
 /// Reads a JSON config. Relative paths are taken relative to the config file.
 pub fn load_config(path: &Path) -> Result<Config, BridgeError> {
@@ -49,10 +71,10 @@ pub enum CrashPoint {
     AfterRequested,
     /// After the verified invoice is written.
     AfterInvoiced,
-    /// After the verified grant is written, before it is installed.
+    /// After the verified grant is written, before it is redeemed.
     AfterGranted,
-    /// After the installed grant is written.
-    AfterInstalled,
+    /// After the redeemed grant is written.
+    AfterRedeemed,
 }
 
 /// Why a command did not complete.
@@ -138,16 +160,18 @@ pub struct PurchaseView {
     pub request_id: String,
     /// The provider's purchase id (hex), once known.
     pub purchase_id: Option<String>,
-    /// The service.
-    pub service: String,
+    /// The versioned service kind.
+    pub service_kind: String,
+    /// The offer bought.
+    pub offer_id: String,
     /// Where the purchase stands.
     pub stage: Stage,
     /// The provider's last reported status.
     pub last_status: Option<String>,
     /// The payment request, when a command decided on one.
     pub payment: Option<PaymentRequest>,
-    /// The installed grant's heights.
-    pub install: Option<Install>,
+    /// The verified grant's entitlement, once granted.
+    pub entitlement: Option<Entitlement>,
     /// A note about the last step.
     pub note: Option<String>,
 }
@@ -157,6 +181,10 @@ pub fn random_bytes<const N: usize>() -> Result<[u8; N], rand_core::Error> {
     let mut out = [0u8; N];
     OsRng.try_fill_bytes(&mut out)?;
     Ok(out)
+}
+
+fn status_name(status: PurchaseStatus) -> String {
+    format!("{status:?}")
 }
 
 /// An open sidecar: configuration, node client and locked state.
@@ -229,14 +257,21 @@ impl Bridge {
 
     fn view(&self, idx: usize, payment: Option<PaymentRequest>) -> PurchaseView {
         let p = &self.state.purchases[idx];
+        let entitlement = p
+            .grant
+            .as_deref()
+            .and_then(|g| hex_bytes(g).ok())
+            .and_then(|g| codec::verify_grant(&g, &self.issuer_key).ok())
+            .map(|g| g.entitlement);
         PurchaseView {
             request_id: p.request_id.clone(),
             purchase_id: p.purchase_id.clone(),
-            service: p.service.clone(),
+            service_kind: p.service_kind.clone(),
+            offer_id: p.offer_id.clone(),
             stage: p.stage,
             last_status: p.last_status.clone(),
             payment,
-            install: p.install,
+            entitlement,
             note: p.note.clone(),
         }
     }
@@ -262,6 +297,19 @@ impl Bridge {
     fn set_note(&mut self, idx: usize, note: Option<String>) -> Result<(), BridgeError> {
         self.state.purchases[idx].note = note;
         self.persist(None)
+    }
+
+    /// Calls a node method with typed parameters and a typed result.
+    fn call<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<R, RpcError> {
+        let params = serde_json::to_value(params)
+            .map_err(|e| RpcError::Protocol(format!("cannot encode {method} parameters: {e}")))?;
+        let value = self.rpc.call(method, params)?;
+        serde_json::from_value(value)
+            .map_err(|e| RpcError::Protocol(format!("malformed {method} answer: {e}")))
     }
 
     fn node_id(&mut self) -> Result<[u8; 32], BridgeError> {
@@ -290,6 +338,12 @@ impl Bridge {
             provider_node_id: self.provider,
             client_node_id: self.node_id()?,
         })
+    }
+
+    fn adapter(&self, idx: usize) -> Result<&'static dyn ServiceAdapter, BridgeError> {
+        let kind = &self.state.purchases[idx].service_kind;
+        adapter_for(kind)
+            .ok_or_else(|| BridgeError::Rejected(format!("no adapter for service kind {kind}")))
     }
 
     fn find(&self, which: &str) -> Result<usize, BridgeError> {
@@ -342,27 +396,38 @@ impl Bridge {
         Err(BridgeError::Rejected(reason))
     }
 
-    /// Starts a purchase, or continues the open one for the same service.
-    pub fn buy(&mut self, service: &str) -> Result<PurchaseView, BridgeError> {
-        if service.is_empty() || service.len() > codec::MAX_SERVICE_LEN {
+    fn keep_for_retry(&mut self, idx: usize, msg: String) -> Result<PurchaseView, BridgeError> {
+        self.set_note(idx, Some(msg.clone()))?;
+        Err(BridgeError::Retryable(msg))
+    }
+
+    /// Starts a purchase of an offer, or continues the open one for the same offer.
+    pub fn buy(&mut self, service_kind: &str, offer_id: &str) -> Result<PurchaseView, BridgeError> {
+        if !codec::is_service_kind(service_kind) {
             return Err(BridgeError::Usage(format!(
-                "service name must be 1 to {} bytes",
-                codec::MAX_SERVICE_LEN
+                "{service_kind:?} is not a versioned service kind such as {}",
+                paid_services_relay::SERVICE_KIND
             )));
         }
-        if let Some(idx) = self
-            .state
-            .purchases
-            .iter()
-            .position(|p| p.service == service && p.stage.is_open())
-        {
+        if !codec::is_offer_id(offer_id) {
+            return Err(BridgeError::Usage(format!(
+                "{offer_id:?} is not an offer id"
+            )));
+        }
+        if adapter_for(service_kind).is_none() {
+            return Err(BridgeError::Usage(format!(
+                "this sidecar has no adapter for service kind {service_kind}"
+            )));
+        }
+        if let Some(idx) = self.state.purchases.iter().position(|p| {
+            p.service_kind == service_kind && p.offer_id == offer_id && p.stage.is_open()
+        }) {
             return match self.state.purchases[idx].stage {
                 Stage::Requested => self.request_invoice(idx),
                 Stage::Invoiced => self.present(idx, true),
                 _ => Ok(self.view_note(
                     idx,
-                    "this service already has a granted purchase; no new purchase was started"
-                        .into(),
+                    "this offer already has a granted purchase; no new purchase was started".into(),
                 )),
             };
         }
@@ -370,13 +435,13 @@ impl Bridge {
             .map_err(|e| BridgeError::Config(format!("the OS random generator failed: {e}")))?;
         self.state.purchases.push(Purchase {
             request_id: hex::encode(request_id),
-            service: service.to_string(),
+            service_kind: service_kind.to_string(),
+            offer_id: offer_id.to_string(),
             stage: Stage::Requested,
             purchase_id: None,
             invoice: None,
             last_status: None,
             grant: None,
-            install: None,
             note: None,
         });
         let idx = self.state.purchases.len() - 1;
@@ -386,19 +451,22 @@ impl Bridge {
 
     fn request_invoice(&mut self, idx: usize) -> Result<PurchaseView, BridgeError> {
         let exp = self.expectations()?;
-        let (service, request_id) = {
+        let adapter = self.adapter(idx)?;
+        let params = {
             let p = &self.state.purchases[idx];
-            (p.service.clone(), p.request_id.clone())
+            RequestInvoiceParams {
+                service_kind: p.service_kind.clone(),
+                offer_id: p.offer_id.clone(),
+                request_id: p.request_id.clone(),
+            }
         };
-        let answer = match self.rpc.call(
-            "paidstream_requestinvoice",
-            json!({"service": service, "request_id": request_id}),
-        ) {
+        let answer: RequestInvoiceResult = match self.call(rpc::REQUEST_INVOICE, &params) {
             Ok(v) => v,
             Err(RpcError::Transport(e)) => {
                 return Err(BridgeError::NodeUnreachable(format!(
-                    "paidstream_requestinvoice got no answer ({e}); the outcome is unknown. \
-                     Run `resume` to retry with the same request_id"
+                    "{} got no answer ({e}); the outcome is unknown. \
+                     Run `resume` to retry with the same request_id",
+                    rpc::REQUEST_INVOICE
                 )))
             }
             Err(RpcError::Rpc { code, message }) if contract::is_final_invoice_error(code) => {
@@ -410,45 +478,41 @@ impl Bridge {
             Err(RpcError::Rpc { code, message }) => {
                 let what = match code {
                     contract::CODE_PROVIDER_UNREACHABLE => "the node could not reach the provider",
-                    contract::CODE_DISABLED => "the paid-stream service is disabled on the node",
+                    contract::CODE_DISABLED => "the paid-services module is disabled on the node",
                     _ => "the node answered with an unrecognized error code",
                 };
-                let msg = format!(
-                    "{what} (code {code}): {message}. The purchase and its request_id are kept; \
-                     run `resume` or `buy` again to retry the same request"
+                return self.keep_for_retry(
+                    idx,
+                    format!(
+                        "{what} (code {code}): {message}. The purchase and its request_id are kept; \
+                         run `resume` or `buy` again to retry the same request"
+                    ),
                 );
-                self.set_note(idx, Some(msg.clone()))?;
-                return Err(BridgeError::Retryable(msg));
             }
-            Err(e @ RpcError::Protocol(_)) => {
-                return Err(node_error("paidstream_requestinvoice", e))
+            // The provider may already hold an invoice for this request_id, so a garbled
+            // answer is retried like a lost one rather than ending the purchase.
+            Err(RpcError::Protocol(e)) => {
+                return self.keep_for_retry(
+                    idx,
+                    format!(
+                        "malformed invoice answer ({e}). The purchase and its request_id are kept; \
+                         run `resume` or `buy` again to retry the same request"
+                    ),
+                )
             }
         };
-        let field = |name: &str| -> Result<String, String> {
-            answer
-                .get(name)
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| format!("answer has no {name}"))
-        };
-        let parsed = field("purchase_id")
-            .and_then(|pid| hex_array::<16>(&pid))
-            .and_then(|pid| {
-                field("invoice")
-                    .and_then(|inv| hex_bytes(&inv))
-                    .map(|inv| (pid, inv))
-            });
+        let parsed = hex_array::<16>(&answer.purchase_id)
+            .and_then(|pid| hex_bytes(&answer.invoice).map(|inv| (pid, inv)));
         let (purchase_id, invoice_bytes) = match parsed {
             Ok(x) => x,
             Err(e) => {
-                // The provider may already hold an invoice for this request_id, so a garbled
-                // answer is retried like a lost one rather than ending the purchase.
-                let msg = format!(
-                    "malformed invoice answer ({e}). The purchase and its request_id are kept; \
-                     run `resume` or `buy` again to retry the same request"
-                );
-                self.set_note(idx, Some(msg.clone()))?;
-                return Err(BridgeError::Retryable(msg));
+                return self.keep_for_retry(
+                    idx,
+                    format!(
+                        "malformed invoice answer ({e}). The purchase and its request_id are kept; \
+                         run `resume` or `buy` again to retry the same request"
+                    ),
+                )
             }
         };
         let inv = match codec::verify_invoice(&invoice_bytes, &self.issuer_key) {
@@ -458,11 +522,15 @@ impl Bridge {
         if let Err(e) = checks::check_invoice(
             &inv,
             &exp,
-            &service,
+            &params.service_kind,
+            &params.offer_id,
             &purchase_id,
             self.cfg.purchase_limit_zat,
         ) {
             return self.reject(idx, format!("invoice rejected: {e}"));
+        }
+        if let Err(e) = adapter.check_invoice(&inv) {
+            return self.reject(idx, format!("invoice rejected by the service adapter: {e}"));
         }
         {
             let p = &mut self.state.purchases[idx];
@@ -476,18 +544,18 @@ impl Bridge {
     }
 
     /// Offers the payment request only while the provider still reports the purchase as
-    /// pending and the local node's height is below the deadline. Otherwise it is withheld.
+    /// pending and the offer window is open. Otherwise it is withheld.
     fn present(&mut self, idx: usize, reshown: bool) -> Result<PurchaseView, BridgeError> {
         let inv = self.stored_invoice(idx)?;
         let pid = self.state.purchases[idx]
             .purchase_id
             .clone()
             .ok_or_else(|| BridgeError::Rejected("invoiced purchase has no purchase_id".into()))?;
-        let status = match self
-            .rpc
-            .call("paidstream_getgrant", json!({"purchase_id": pid}))
-        {
-            Ok(v) => v.get("status").and_then(Value::as_str).map(str::to_string),
+        let answer: GetGrantResult = match self.call(
+            rpc::GET_GRANT,
+            &GetGrantParams { purchase_id: pid },
+        ) {
+            Ok(v) => v,
             Err(e) => {
                 return Ok(self.withheld(
                     idx,
@@ -495,28 +563,26 @@ impl Bridge {
                 ))
             }
         };
-        let Some(status) = status else {
-            return Ok(self.withheld(
-                idx,
-                "the provider's answer has no status; no payment request shown",
-            ));
-        };
+        let status = status_name(answer.status);
         if self.state.purchases[idx].last_status.as_deref() != Some(status.as_str()) {
             self.state.purchases[idx].last_status = Some(status.clone());
             self.persist(None)?;
         }
-        if status == "PaymentSeen" {
-            return Ok(self.withheld(
-                idx,
-                "the provider has seen a payment that is still short of its confirmations; \
-                 no payment request shown. Run `status` to follow it",
-            ));
-        }
-        if status != "Pending" {
-            return Ok(self.withheld(
-                idx,
-                format!("purchase status is {status}; no payment request shown. Run `status` to follow it"),
-            ));
+        match answer.status {
+            PurchaseStatus::Pending => {}
+            PurchaseStatus::PaymentSeen => {
+                return Ok(self.withheld(
+                    idx,
+                    "the provider has seen a payment that is still short of its confirmations; \
+                     no payment request shown. Run `status` to follow it",
+                ))
+            }
+            _ => {
+                return Ok(self.withheld(
+                    idx,
+                    format!("purchase status is {status}; no payment request shown. Run `status` to follow it"),
+                ))
+            }
         }
         let tip = self
             .rpc
@@ -594,8 +660,8 @@ impl Bridge {
                 "no verified invoice yet; run `resume` to retry the invoice request with the same request_id".into(),
             )),
             Stage::Rejected | Stage::Expired => Ok(self.view(idx, None)),
-            Stage::Granted => self.install(idx),
-            Stage::Invoiced | Stage::Installed => self.poll_grant(idx),
+            Stage::Granted => self.redeem(idx),
+            Stage::Invoiced | Stage::Redeemed => self.poll_grant(idx),
         };
         match result {
             Err(BridgeError::NodeUnreachable(e)) | Err(BridgeError::Node(e)) => {
@@ -608,65 +674,57 @@ impl Bridge {
     fn poll_grant(&mut self, idx: usize) -> Result<PurchaseView, BridgeError> {
         let inv = self.stored_invoice(idx)?;
         let exp = self.expectations()?;
-        let pid = hex::encode(inv.purchase_id);
-        let answer = self
-            .rpc
-            .call("paidstream_getgrant", json!({"purchase_id": pid}))
-            .map_err(|e| node_error("paidstream_getgrant", e))?;
-        let status = answer
-            .get("status")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::Node("paidstream_getgrant answer has no status".into()))?
-            .to_string();
-        let grant_hex = answer
-            .get("grant")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        self.state.purchases[idx].last_status = Some(status.clone());
+        let answer: GetGrantResult = self
+            .call(
+                rpc::GET_GRANT,
+                &GetGrantParams {
+                    purchase_id: hex::encode(inv.purchase_id),
+                },
+            )
+            .map_err(|e| node_error(rpc::GET_GRANT, e))?;
+        self.state.purchases[idx].last_status = Some(status_name(answer.status));
 
-        match (status.as_str(), grant_hex) {
-            ("Issued", Some(g)) | ("Expired", Some(g)) => {
+        match (answer.status, answer.grant) {
+            (PurchaseStatus::Issued | PurchaseStatus::Expired, Some(g)) => {
                 if let Err(reason) = self.accept_grant(idx, &g, &inv, &exp) {
                     self.set_note(
                         idx,
-                        Some(format!("grant rejected: {reason}; nothing was installed")),
+                        Some(format!("grant rejected: {reason}; nothing was redeemed")),
                     )?;
                     return Ok(self.view(idx, None));
                 }
-                let stage = self.state.purchases[idx].stage;
-                if status == "Expired" {
+                if answer.status == PurchaseStatus::Expired {
                     self.state.purchases[idx].stage = Stage::Expired;
                     self.set_note(idx, None)?;
                     return Ok(self.view(idx, None));
                 }
-                if stage == Stage::Installed {
+                if self.state.purchases[idx].stage == Stage::Redeemed {
                     self.persist(None)?;
                     return Ok(self.view(idx, None));
                 }
                 self.state.purchases[idx].stage = Stage::Granted;
                 self.state.purchases[idx].note = None;
                 self.persist(Some(CrashPoint::AfterGranted))?;
-                self.install(idx)
+                self.redeem(idx)
             }
-            ("Issued", None) => {
+            (PurchaseStatus::Issued, None) => {
                 self.set_note(
                     idx,
                     Some("the answer said Issued but carried no grant; ignored. Access is only taken from a verified grant".into()),
                 )?;
                 Ok(self.view(idx, None))
             }
-            ("Expired", None) => {
+            (PurchaseStatus::Expired, None) => {
                 self.state.purchases[idx].stage = Stage::Expired;
                 self.set_note(idx, None)?;
                 Ok(self.view(idx, None))
             }
-            ("Pending" | "PaymentSeen" | "Underpaid" | "NeedsReconciliation" | "NotFound", _) => {
-                self.persist(None)?;
+            (PurchaseStatus::Unknown, _) => {
+                self.set_note(idx, Some("unknown provider status; ignored".into()))?;
                 Ok(self.view(idx, None))
             }
-            (other, _) => {
-                let note = format!("unknown provider status {other:?}; ignored");
-                self.set_note(idx, Some(note))?;
+            _ => {
+                self.persist(None)?;
                 Ok(self.view(idx, None))
             }
         }
@@ -679,9 +737,11 @@ impl Bridge {
         inv: &Invoice,
         exp: &Expectations,
     ) -> Result<(), String> {
+        let adapter = self.adapter(idx).map_err(|e| e.to_string())?;
         let bytes = hex_bytes(grant_hex)?;
         let grant = codec::verify_grant(&bytes, &self.issuer_key).map_err(|e| e.to_string())?;
         checks::check_grant(&grant, inv, exp).map_err(|e| e.to_string())?;
+        adapter.check_grant(&grant)?;
         let encoded = hex::encode(&bytes);
         let p = &mut self.state.purchases[idx];
         if let Some(existing) = &p.grant {
@@ -696,7 +756,8 @@ impl Bridge {
         Ok(())
     }
 
-    fn install(&mut self, idx: usize) -> Result<PurchaseView, BridgeError> {
+    /// Redeems the stored grant the way its service's adapter says.
+    fn redeem(&mut self, idx: usize) -> Result<PurchaseView, BridgeError> {
         let grant_hex = self.state.purchases[idx]
             .grant
             .clone()
@@ -704,41 +765,34 @@ impl Bridge {
         let bytes = hex_bytes(&grant_hex).map_err(BridgeError::Rejected)?;
         let grant = codec::verify_grant(&bytes, &self.issuer_key)
             .map_err(|e| BridgeError::Rejected(format!("stored grant no longer verifies: {e}")))?;
-        match self
-            .rpc
-            .call("paidstream_setgrant", json!({"grant": grant_hex}))
-        {
-            Ok(v) => {
-                let installed = v.get("installed").and_then(Value::as_bool) == Some(true);
-                let start = v.get("start_height").and_then(Value::as_u64);
-                let end = v.get("end_height").and_then(Value::as_u64);
-                if !installed
-                    || start != Some(u64::from(grant.start_height))
-                    || end != Some(u64::from(grant.end_height))
-                {
+        match self.adapter(idx)?.redemption() {
+            Redemption::InstallOnNode => {}
+        }
+        let answer: Result<InstallGrantResult, RpcError> =
+            self.call(rpc::INSTALL_GRANT, &InstallGrantParams { grant: grant_hex });
+        match answer {
+            Ok(r) => {
+                if !r.installed || r.grant_id != hex::encode(grant.grant_id) {
                     self.set_note(
                         idx,
-                        Some("the node's setgrant answer does not match the grant; not marked installed".into()),
+                        Some("the node's install answer does not match the grant; not marked redeemed".into()),
                     )?;
                     return Ok(self.view(idx, None));
                 }
                 let p = &mut self.state.purchases[idx];
-                p.install = Some(Install {
-                    start_height: grant.start_height,
-                    end_height: grant.end_height,
-                });
                 if p.stage != Stage::Expired {
-                    p.stage = Stage::Installed;
+                    p.stage = Stage::Redeemed;
                 }
                 p.note = None;
-                self.persist(Some(CrashPoint::AfterInstalled))?;
+                self.persist(Some(CrashPoint::AfterRedeemed))?;
                 Ok(self.view(idx, None))
             }
             Err(RpcError::Transport(e)) => {
                 self.set_note(
                     idx,
                     Some(format!(
-                        "paidstream_setgrant got no answer ({e}); run `resume` to install the same grant again"
+                        "{} got no answer ({e}); run `resume` to install the same grant again",
+                        rpc::INSTALL_GRANT
                     )),
                 )?;
                 Ok(self.view(idx, None))
@@ -762,8 +816,8 @@ impl Bridge {
                     }
                     other => other,
                 },
-                Stage::Granted => self.install(idx),
-                Stage::Installed => self.install(idx).and_then(|_| self.refresh(idx)),
+                Stage::Granted => self.redeem(idx),
+                Stage::Redeemed => self.redeem(idx).and_then(|_| self.refresh(idx)),
                 Stage::Rejected | Stage::Expired => Ok(self.view(idx, None)),
             };
             match result {
@@ -785,7 +839,7 @@ impl Bridge {
                 idx,
                 "the invoice failed a check; it is never shown as a payment request",
             )),
-            Stage::Granted | Stage::Installed => {
+            Stage::Granted | Stage::Redeemed => {
                 Ok(self.withheld(idx, "a grant was already issued for this purchase"))
             }
             Stage::Expired => Ok(self.withheld(idx, "the purchase expired")),

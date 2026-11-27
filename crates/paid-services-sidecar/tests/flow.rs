@@ -11,22 +11,24 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use paid_services_mock::{
-    self as mock, MockError, MockIssuer, MockNode, MockParams, Tamper, OTHER_CLIENT_NODE_ID,
-    TEST_CLIENT_NODE_ID, TEST_PROVIDER_NODE_ID,
+    self as mock, MockError, MockIssuer, MockNode, MockOffer, MockParams, Tamper,
+    OTHER_CLIENT_NODE_ID, TEST_CLIENT_NODE_ID, TEST_PROVIDER_NODE_ID,
 };
 use paid_services_sidecar::bridge::{
     Bridge, BridgeError, Config, CrashPoint, PaymentRequest, PurchaseView,
 };
 use paid_services_sidecar::rpc::{RpcClient, RpcError};
 use paid_services_sidecar::state::{Stage, StateError};
-use paid_services_types::codec::{self, Invoice, Network};
+use paid_services_types::codec::{self, Invoice, Network, Terms};
 use paid_services_types::contract;
 use paid_services_types::expiry::LIBRUSTZCASH_DEFAULT;
+use paid_services_types::rpc;
 use paid_services_types::{hex_array, uri};
 
 const BIN: &str = env!("CARGO_BIN_EXE_paid-services-sidecar");
 const COOKIE: &str = "__cookie__:flow-test-cookie";
-const SERVICE: &str = "synthetic-10";
+const KIND: &str = paid_services_relay::SERVICE_KIND;
+const OFFER: &str = "relay-10";
 const OFFER_MARGIN: u32 = 10;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -59,7 +61,11 @@ fn spawn_node(issuer: &MockIssuer, client: [u8; 32], controls: bool) -> MockNode
 }
 
 fn env_with(name: &str, limit_zat: u64) -> Env {
-    let issuer = MockIssuer::new(MockParams::default());
+    env_with_params(name, limit_zat, MockParams::default())
+}
+
+fn env_with_params(name: &str, limit_zat: u64, params: MockParams) -> Env {
+    let issuer = MockIssuer::new(params);
     let node = spawn_node(&issuer, TEST_CLIENT_NODE_ID, true);
     let dir = fresh_dir(name);
     let cookie_file = dir.join("node.cookie");
@@ -138,7 +144,7 @@ fn text(bytes: &[u8]) -> String {
 fn signed_invoice_to_uri_pending_issued_verified_grant_mock_install() {
     let env = env("happy");
     let mut b = open(&env);
-    let v = b.buy(SERVICE).unwrap();
+    let v = b.buy(KIND, OFFER).unwrap();
     assert_eq!(v.stage, Stage::Invoiced);
     let (request, reshown) = offered(&v);
     assert!(!reshown);
@@ -170,11 +176,11 @@ fn signed_invoice_to_uri_pending_issued_verified_grant_mock_install() {
     // A seen payment withholds the request, for `show` and for a repeated `buy`.
     let shown = b.show(v.purchase_id.as_deref().unwrap()).unwrap();
     assert!(withheld(&shown).contains("seen a payment"));
-    assert!(withheld(&b.buy(SERVICE).unwrap()).contains("seen a payment"));
+    assert!(withheld(&b.buy(KIND, OFFER).unwrap()).contains("seen a payment"));
 
     env.issuer.mine(1); // 3 of 3
     let v = b.status(None).unwrap().remove(0);
-    assert_eq!(v.stage, Stage::Installed);
+    assert_eq!(v.stage, Stage::Redeemed);
     assert_eq!(v.last_status.as_deref(), Some("Issued"));
     let grant_bytes = env.issuer.grant_bytes(pid).unwrap();
     assert_eq!(env.node.installed(pid).unwrap(), grant_bytes);
@@ -184,13 +190,11 @@ fn signed_invoice_to_uri_pending_issued_verified_grant_mock_install() {
     );
     let key = codec::verification_key(env.issuer.public_key()).unwrap();
     let grant = codec::verify_grant(&grant_bytes, &key).unwrap();
-    let install = v.install.unwrap();
-    assert_eq!(
-        (install.start_height, install.end_height),
-        (grant.start_height, grant.end_height)
-    );
-
-    env.issuer.mine(inv.access_blocks);
+    assert_eq!(v.entitlement, Some(grant.entitlement));
+    let Terms::HeightWindow { blocks } = inv.terms else {
+        panic!("the relay offer sells a height window");
+    };
+    env.issuer.mine(blocks);
     let v = b.status(None).unwrap().remove(0);
     assert_eq!(v.stage, Stage::Expired);
 }
@@ -198,9 +202,9 @@ fn signed_invoice_to_uri_pending_issued_verified_grant_mock_install() {
 #[test]
 fn lost_requestinvoice_answer_is_retried_with_the_same_request_id() {
     let env = env("lost-requestinvoice");
-    env.node.drop_next("paidstream_requestinvoice");
+    env.node.drop_next(rpc::REQUEST_INVOICE);
     let mut b = open(&env);
-    let err = b.buy(SERVICE).unwrap_err();
+    let err = b.buy(KIND, OFFER).unwrap_err();
     assert!(matches!(err, BridgeError::NodeUnreachable(_)), "{err}");
     assert_eq!(b.state().purchases[0].stage, Stage::Requested);
     assert_eq!(
@@ -222,7 +226,7 @@ fn lost_requestinvoice_answer_is_retried_with_the_same_request_id() {
     let (first, _) = offered(&v);
 
     // Buying the same service again continues the same purchase with the same request.
-    let again = b.buy(SERVICE).unwrap();
+    let again = b.buy(KIND, OFFER).unwrap();
     assert_eq!(again.purchase_id, v.purchase_id);
     let (second, reshown) = offered(&again);
     assert_eq!(first, second);
@@ -235,16 +239,16 @@ fn lost_requestinvoice_answer_is_retried_with_the_same_request_id() {
 fn lost_getgrant_answer_changes_nothing() {
     let env = env("lost-getgrant");
     let mut b = open(&env);
-    let pid = pid_of(&b.buy(SERVICE).unwrap());
+    let pid = pid_of(&b.buy(KIND, OFFER).unwrap());
     pay_and_confirm(&env, pid);
-    env.node.drop_next("paidstream_getgrant");
+    env.node.drop_next(rpc::GET_GRANT);
     let v = b.status(None).unwrap().remove(0);
     assert_eq!(v.stage, Stage::Invoiced);
     assert!(v.note.unwrap().contains("got no answer"));
     assert_eq!(env.node.installed_count(), 0);
 
     let v = b.status(None).unwrap().remove(0);
-    assert_eq!(v.stage, Stage::Installed);
+    assert_eq!(v.stage, Stage::Redeemed);
     assert_eq!(
         env.node.installed(pid).unwrap(),
         env.issuer.grant_bytes(pid).unwrap()
@@ -252,20 +256,20 @@ fn lost_getgrant_answer_changes_nothing() {
 }
 
 #[test]
-fn lost_setgrant_answer_reinstalls_the_same_grant() {
-    let env = env("lost-setgrant");
+fn lost_installgrant_answer_reinstalls_the_same_grant() {
+    let env = env("lost-installgrant");
     let mut b = open(&env);
-    let pid = pid_of(&b.buy(SERVICE).unwrap());
+    let pid = pid_of(&b.buy(KIND, OFFER).unwrap());
     pay_and_confirm(&env, pid);
-    env.node.drop_next("paidstream_setgrant");
+    env.node.drop_next(rpc::INSTALL_GRANT);
     let v = b.status(None).unwrap().remove(0);
     assert_eq!(v.stage, Stage::Granted);
-    assert!(v.note.unwrap().contains("setgrant got no answer"));
+    assert!(v.note.unwrap().contains("installgrant got no answer"));
     assert_eq!(env.node.installed_count(), 1, "the node did process it");
 
     let v = b.resume().unwrap().remove(0);
-    assert_eq!(v.stage, Stage::Installed);
-    assert_eq!(env.node.calls("paidstream_setgrant"), 2);
+    assert_eq!(v.stage, Stage::Redeemed);
+    assert_eq!(env.node.calls(rpc::INSTALL_GRANT), 2);
     assert_eq!(env.node.installed_count(), 1);
     assert_eq!(
         env.node.installed(pid).unwrap(),
@@ -284,7 +288,7 @@ fn restart_after_each_persisted_step() {
         CrashPoint::AfterRequested,
         CrashPoint::AfterInvoiced,
         CrashPoint::AfterGranted,
-        CrashPoint::AfterInstalled,
+        CrashPoint::AfterRedeemed,
     ] {
         let env = env(&format!("restart-{point:?}"));
         {
@@ -292,10 +296,10 @@ fn restart_after_each_persisted_step() {
             let err = match point {
                 CrashPoint::AfterRequested | CrashPoint::AfterInvoiced => {
                     b.set_crash_point(Some(point));
-                    b.buy(SERVICE).unwrap_err()
+                    b.buy(KIND, OFFER).unwrap_err()
                 }
-                CrashPoint::AfterGranted | CrashPoint::AfterInstalled => {
-                    let pid = pid_of(&b.buy(SERVICE).unwrap());
+                CrashPoint::AfterGranted | CrashPoint::AfterRedeemed => {
+                    let pid = pid_of(&b.buy(KIND, OFFER).unwrap());
                     pay_and_confirm(&env, pid);
                     b.set_crash_point(Some(point));
                     b.status(None).unwrap_err()
@@ -311,7 +315,7 @@ fn restart_after_each_persisted_step() {
             CrashPoint::AfterRequested => "requested",
             CrashPoint::AfterInvoiced => "invoiced",
             CrashPoint::AfterGranted => "granted",
-            CrashPoint::AfterInstalled => "installed",
+            CrashPoint::AfterRedeemed => "redeemed",
         };
         assert_eq!(stage_on_disk(&env.cfg.state_file), expected_on_disk);
         let invoices_before = env.issuer.invoices_created();
@@ -330,8 +334,8 @@ fn restart_after_each_persisted_step() {
                 assert_eq!(v.stage, Stage::Invoiced, "{point:?}");
                 offered(&v);
             }
-            CrashPoint::AfterGranted | CrashPoint::AfterInstalled => {
-                assert_eq!(v.stage, Stage::Installed, "{point:?}");
+            CrashPoint::AfterGranted | CrashPoint::AfterRedeemed => {
+                assert_eq!(v.stage, Stage::Redeemed, "{point:?}");
                 let pid = pid_of(&v);
                 assert_eq!(env.node.installed_count(), 1);
                 assert_eq!(
@@ -349,28 +353,29 @@ fn same_request_id_repeats_and_conflicting_terms() {
     let issuer = MockIssuer::new(MockParams::default());
     let request_id = [7u8; 16];
     let first = issuer
-        .request_invoice(TEST_CLIENT_NODE_ID, "synthetic-10", request_id)
+        .request_invoice(TEST_CLIENT_NODE_ID, KIND, "relay-10", request_id)
         .unwrap();
     let again = issuer
-        .request_invoice(TEST_CLIENT_NODE_ID, "synthetic-10", request_id)
+        .request_invoice(TEST_CLIENT_NODE_ID, KIND, "relay-10", request_id)
         .unwrap();
     assert_eq!(first, again);
     assert_eq!(issuer.invoices_created(), 1);
     assert_eq!(
-        issuer.request_invoice(TEST_CLIENT_NODE_ID, "synthetic-20", request_id),
+        issuer.request_invoice(TEST_CLIENT_NODE_ID, KIND, "relay-20", request_id),
         Err(MockError::RequestConflict)
     );
 
     // The bridge: a stored request whose terms now conflict is rejected and shows nothing.
     let env = env("conflict");
     env.issuer
-        .request_invoice(TEST_CLIENT_NODE_ID, "synthetic-10", request_id)
+        .request_invoice(TEST_CLIENT_NODE_ID, KIND, "relay-10", request_id)
         .unwrap();
     let state = json!({
-        "format": 1,
+        "format": 2,
         "purchases": [{
             "request_id": hex::encode(request_id),
-            "service": "synthetic-20",
+            "service_kind": KIND,
+            "offer_id": "relay-20",
             "stage": "requested"
         }]
     });
@@ -397,7 +402,7 @@ fn tampered_invoices_never_become_payment_requests() {
         let env = env(&format!("tamper-{tamper:?}"));
         env.node.set_tamper(tamper);
         let mut b = open(&env);
-        match b.buy(SERVICE).unwrap_err() {
+        match b.buy(KIND, OFFER).unwrap_err() {
             BridgeError::Rejected(msg) => assert!(msg.contains(expected), "{tamper:?}: {msg}"),
             other => panic!("{tamper:?}: {other}"),
         }
@@ -419,7 +424,7 @@ fn tampered_grants_are_not_installed() {
     ] {
         let env = env(&format!("tamper-{tamper:?}"));
         let mut b = open(&env);
-        let pid = pid_of(&b.buy(SERVICE).unwrap());
+        let pid = pid_of(&b.buy(KIND, OFFER).unwrap());
         env.node.set_tamper(tamper);
         pay_and_confirm(&env, pid);
         let v = b.status(None).unwrap().remove(0);
@@ -428,7 +433,7 @@ fn tampered_grants_are_not_installed() {
         assert!(note.contains(expected), "{tamper:?}: {note}");
         assert!(b.state().purchases[0].grant.is_none());
         assert_eq!(env.node.installed_count(), 0);
-        assert_eq!(env.node.calls("paidstream_setgrant"), 0);
+        assert_eq!(env.node.calls(rpc::INSTALL_GRANT), 0);
     }
 }
 
@@ -436,15 +441,15 @@ fn tampered_grants_are_not_installed() {
 fn mock_contract_setgrant_refuses_a_grant_for_another_node() {
     let env = env("foreign-grant");
     let mut b = open(&env);
-    let pid = pid_of(&b.buy(SERVICE).unwrap());
+    let pid = pid_of(&b.buy(KIND, OFFER).unwrap());
     pay_and_confirm(&env, pid);
-    assert_eq!(b.status(None).unwrap()[0].stage, Stage::Installed);
+    assert_eq!(b.status(None).unwrap()[0].stage, Stage::Redeemed);
     let grant = env.issuer.grant_bytes(pid).unwrap();
 
     let other = spawn_node(&env.issuer, OTHER_CLIENT_NODE_ID, false);
     let client = RpcClient::new(other.addr, COOKIE).unwrap();
     let err = client
-        .call("paidstream_setgrant", json!({"grant": hex::encode(&grant)}))
+        .call(rpc::INSTALL_GRANT, json!({"grant": hex::encode(&grant)}))
         .unwrap_err();
     assert!(
         matches!(&err, RpcError::Rpc { code, .. } if *code == mock::CODE_INVALID_GRANT),
@@ -459,21 +464,18 @@ fn mock_contract_setgrant_refuses_a_grant_for_another_node() {
 fn mock_contract_getgrant_from_another_nodeid_is_not_found() {
     let env = env("other-nodeid");
     let mut b = open(&env);
-    let pid = pid_of(&b.buy(SERVICE).unwrap());
+    let pid = pid_of(&b.buy(KIND, OFFER).unwrap());
     pay_and_confirm(&env, pid);
 
     let other = spawn_node(&env.issuer, OTHER_CLIENT_NODE_ID, false);
     let client = RpcClient::new(other.addr, COOKIE).unwrap();
     let answer = client
-        .call(
-            "paidstream_getgrant",
-            json!({"purchase_id": hex::encode(pid)}),
-        )
+        .call(rpc::GET_GRANT, json!({"purchase_id": hex::encode(pid)}))
         .unwrap();
     assert_eq!(answer, json!({"status": "NotFound"}));
     let unknown = client
         .call(
-            "paidstream_getgrant",
+            rpc::GET_GRANT,
             json!({"purchase_id": hex::encode([9u8; 16])}),
         )
         .unwrap();
@@ -490,7 +492,7 @@ fn mock_contract_getgrant_from_another_nodeid_is_not_found() {
 fn invoice_above_the_purchase_limit_is_rejected() {
     let env = env_with("over-limit", 10_000);
     let mut b = open(&env);
-    match b.buy(SERVICE).unwrap_err() {
+    match b.buy(KIND, OFFER).unwrap_err() {
         BridgeError::Rejected(msg) => assert!(msg.contains("purchase limit"), "{msg}"),
         other => panic!("{other}"),
     }
@@ -503,10 +505,11 @@ fn corrupt_state_file_is_refused_and_left_untouched() {
         ("garbage", "{not json".to_string()),
         (
             "inconsistent",
-            json!({"format": 1, "purchases": [{
+            json!({"format": 2, "purchases": [{
                 "request_id": "00112233445566778899aabbccddeeff",
-                "service": "synthetic-10",
-                "stage": "installed"
+                "service_kind": KIND,
+                "offer_id": OFFER,
+                "stage": "redeemed"
             }]})
             .to_string(),
         ),
@@ -546,7 +549,7 @@ fn a_second_process_on_the_same_state_is_locked_out() {
     );
 
     let cfg_path = write_config(&env);
-    let out = cli(&["--config", cfg_path.to_str().unwrap(), "buy", SERVICE]);
+    let out = cli(&["--config", cfg_path.to_str().unwrap(), "buy", KIND, OFFER]);
     assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("holds the lock"));
     assert_eq!(env.issuer.invoices_created(), 0);
@@ -574,7 +577,7 @@ fn a_second_process_on_the_same_state_is_locked_out() {
 fn expired_invoice_is_not_offered_again() {
     let env = env("expired");
     let mut b = open(&env);
-    let v = b.buy(SERVICE).unwrap();
+    let v = b.buy(KIND, OFFER).unwrap();
     offered(&v);
     let pid = pid_of(&v);
     let inv = invoice_of(&env, pid);
@@ -593,7 +596,7 @@ fn expired_invoice_is_not_offered_again() {
     let shown = b.show(v.purchase_id.as_deref().unwrap()).unwrap();
     assert!(withheld(&shown).contains("expired"));
     assert!(
-        b.buy(SERVICE).is_ok(),
+        b.buy(KIND, OFFER).is_ok(),
         "a new purchase may start after expiry"
     );
 }
@@ -607,7 +610,7 @@ fn no_grant_from_a_local_txid_or_a_user_claim() {
     for args in [
         vec!["--config", cfg, "status", "--txid", "00ff"],
         vec!["--config", cfg, "status", "--paid"],
-        vec!["--config", cfg, "buy", SERVICE, "--txid", "00ff"],
+        vec!["--config", cfg, "buy", KIND, OFFER, "--txid", "00ff"],
         vec!["--config", cfg, "show", "--paid"],
     ] {
         let out = cli(&args);
@@ -617,7 +620,7 @@ fn no_grant_from_a_local_txid_or_a_user_claim() {
 
     // Without a verified grant nothing is installed, however far the chain moves.
     let mut b = open(&env);
-    b.buy(SERVICE).unwrap();
+    b.buy(KIND, OFFER).unwrap();
     env.issuer.mine(400);
     let v = b.status(None).unwrap().remove(0);
     assert_eq!(v.stage, Stage::Expired);
@@ -639,7 +642,7 @@ fn underpaid_and_noncompliant_payments_get_no_grant_and_no_new_request() {
     ] {
         let env = env(name);
         let mut b = open(&env);
-        let v = b.buy(SERVICE).unwrap();
+        let v = b.buy(KIND, OFFER).unwrap();
         let pid = pid_of(&v);
         env.issuer.pay(pid, amount, expiry).unwrap();
         env.issuer.mine(5);
@@ -676,7 +679,7 @@ fn destinations_and_rpc_endpoints_are_checked() {
 fn the_offer_window_closes_early_but_does_not_stop_a_late_payment() {
     let env = env("offer-window");
     let mut b = open(&env);
-    let v = b.buy(SERVICE).unwrap();
+    let v = b.buy(KIND, OFFER).unwrap();
     let pid = pid_of(&v);
     let inv = invoice_of(&env, pid);
     let profile = LIBRUSTZCASH_DEFAULT;
@@ -716,7 +719,7 @@ fn malformed_invoice_answer_keeps_the_request_for_retry() {
     let env = env("malformed-answer");
     env.node.set_tamper(Tamper::MalformedInvoiceAnswer);
     let mut b = open(&env);
-    let err = b.buy(SERVICE).unwrap_err();
+    let err = b.buy(KIND, OFFER).unwrap_err();
     assert!(
         matches!(&err, BridgeError::Retryable(m) if m.contains("malformed invoice answer")),
         "{err}"
@@ -733,7 +736,7 @@ fn malformed_invoice_answer_keeps_the_request_for_retry() {
     offered(&v);
 }
 
-const REQUEST_INVOICE: &str = "paidstream_requestinvoice";
+const REQUEST_INVOICE: &str = rpc::REQUEST_INVOICE;
 
 #[test]
 fn transient_error_before_the_provider_keeps_the_request_for_retry() {
@@ -745,7 +748,7 @@ fn transient_error_before_the_provider_keeps_the_request_for_retry() {
         false,
     );
     let mut b = open(&env);
-    let err = b.buy(SERVICE).unwrap_err();
+    let err = b.buy(KIND, OFFER).unwrap_err();
     assert!(matches!(err, BridgeError::Retryable(_)), "{err}");
     assert_eq!(err.exit_code(), 5);
     assert_eq!(b.state().purchases[0].stage, Stage::Requested);
@@ -771,14 +774,14 @@ fn transient_error_after_the_provider_recorded_the_request_returns_the_same_invo
         true,
     );
     let mut b = open(&env);
-    let err = b.buy(SERVICE).unwrap_err();
+    let err = b.buy(KIND, OFFER).unwrap_err();
     assert!(matches!(err, BridgeError::Retryable(_)), "{err}");
     assert_eq!(b.state().purchases[0].stage, Stage::Requested);
     assert_eq!(env.issuer.invoices_created(), 1, "the provider recorded it");
     let request_id = b.state().purchases[0].request_id.clone();
 
     // The next buy continues the same purchase; it does not start a new request.
-    let v = b.buy(SERVICE).unwrap();
+    let v = b.buy(KIND, OFFER).unwrap();
     assert_eq!(v.stage, Stage::Invoiced);
     assert_eq!(v.request_id, request_id);
     assert_eq!(b.state().purchases.len(), 1);
@@ -794,7 +797,7 @@ fn transient_error_after_the_provider_recorded_the_request_returns_the_same_invo
 fn definitive_provider_rejection_is_final_and_reported() {
     let env = env("definitive-reject");
     let mut b = open(&env);
-    match b.buy("no-such-service").unwrap_err() {
+    match b.buy(KIND, "no-such-offer").unwrap_err() {
         BridgeError::Rejected(msg) => {
             assert!(
                 msg.contains("code 3") && msg.contains("UnknownService"),
@@ -816,7 +819,8 @@ fn definitive_provider_rejection_is_final_and_reported() {
         "--config",
         cfg_path.to_str().unwrap(),
         "buy",
-        "another-unknown-service",
+        KIND,
+        "another-unknown-offer",
     ]);
     assert_eq!(out.status.code(), Some(6), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
@@ -837,7 +841,7 @@ fn unrecognized_or_nonfinal_error_codes_keep_the_request() {
         env.node
             .fail_next(REQUEST_INVOICE, code, "test error", false);
         let mut b = open(&env);
-        match b.buy(SERVICE).unwrap_err() {
+        match b.buy(KIND, OFFER).unwrap_err() {
             BridgeError::Retryable(msg) => {
                 assert!(
                     msg.contains(expected) && msg.contains(&format!("code {code}")),
@@ -867,7 +871,7 @@ fn cli_end_to_end_against_the_mock_node() {
     let cfg_path = write_config(&env);
     let cfg = cfg_path.to_str().unwrap();
 
-    let out = cli(&["--config", cfg, "buy", SERVICE]);
+    let out = cli(&["--config", cfg, "buy", KIND, OFFER]);
     let stdout = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("SIMULATION ONLY"));
@@ -884,9 +888,47 @@ fn cli_end_to_end_against_the_mock_node() {
     let out = cli(&["--config", cfg, "status"]);
     let stdout = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    assert!(stdout.contains("stage installed"), "{stdout}");
+    assert!(stdout.contains("stage redeemed"), "{stdout}");
     assert!(stdout.contains("mock install"), "{stdout}");
 
     let out = cli(&["--config", cfg, "show", &pid]);
     assert!(text(&out.stdout).contains("already issued"));
+}
+
+#[test]
+fn the_sidecar_buys_only_kinds_it_has_an_adapter_for() {
+    let env = env("adapters");
+    let mut b = open(&env);
+    for (kind, offer, expected) in [
+        ("not a kind", OFFER, "not a versioned service kind"),
+        ("example.other/1", OFFER, "no adapter for service kind"),
+        (KIND, "bad offer", "not an offer id"),
+    ] {
+        match b.buy(kind, offer).unwrap_err() {
+            BridgeError::Usage(msg) => assert!(msg.contains(expected), "{kind}: {msg}"),
+            other => panic!("{kind}: {other}"),
+        }
+    }
+    assert!(b.state().purchases.is_empty(), "nothing was requested");
+    assert_eq!(env.issuer.invoices_created(), 0);
+}
+
+#[test]
+fn the_relay_adapter_rejects_terms_it_does_not_sell() {
+    let mut params = MockParams::default();
+    let mut quota = MockOffer::relay("relay-quota", 25_000, 10);
+    quota.terms = Terms::Quota { units: 5 };
+    params.offers.push(quota);
+    let env = env_with_params("relay-quota", 100_000, params);
+    let mut b = open(&env);
+    match b.buy(KIND, "relay-quota").unwrap_err() {
+        BridgeError::Rejected(msg) => {
+            assert!(
+                msg.contains("service adapter") && msg.contains("height windows"),
+                "{msg}"
+            )
+        }
+        other => panic!("{other}"),
+    }
+    assert_eq!(b.state().purchases[0].stage, Stage::Rejected);
 }

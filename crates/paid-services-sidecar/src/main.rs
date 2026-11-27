@@ -6,7 +6,18 @@ use clap::{value_parser, Arg, ArgMatches, Command};
 use paid_services_sidecar::bridge::{
     load_config, Bridge, BridgeError, PaymentRequest, PurchaseView, SIMULATION_NOTICE,
 };
+use paid_services_sidecar::state::Stage;
+use paid_services_types::codec::Entitlement;
 use paid_services_types::uri::format_zec;
+use qrcode::render::unicode::Dense1x2;
+use qrcode::QrCode;
+
+/// The payment request as a terminal QR code, for a wallet to scan. Simulation only: the
+/// mock requests are not meant to be paid.
+fn qr(uri: &str) -> Option<String> {
+    let code = QrCode::new(uri.as_bytes()).ok()?;
+    Some(code.render::<Dense1x2>().quiet_zone(true).build())
+}
 
 fn cli() -> Command {
     let purchase = || {
@@ -26,8 +37,14 @@ fn cli() -> Command {
         .subcommand_required(true)
         .subcommand(
             Command::new("buy")
-                .about("Start a purchase, or continue the open one for SERVICE")
-                .arg(Arg::new("service").value_name("SERVICE").required(true)),
+                .about("Start a purchase of an offer, or continue the open one for that offer")
+                .arg(
+                    Arg::new("kind")
+                        .value_name("SERVICE_KIND")
+                        .required(true)
+                        .help("A versioned service kind, for example zakura.relay.blockstream/1"),
+                )
+                .arg(Arg::new("offer").value_name("OFFER_ID").required(true)),
         )
         .subcommand(
             Command::new("status")
@@ -63,9 +80,11 @@ fn run(matches: &ArgMatches) -> i32 {
     };
     let arg = |m: &ArgMatches, name: &str| m.get_one::<String>(name).cloned();
     let result = match matches.subcommand() {
-        Some(("buy", m)) => match arg(m, "service") {
-            Some(service) => bridge.buy(&service).map(|v| vec![v]),
-            None => Err(BridgeError::Usage("buy needs a SERVICE".into())),
+        Some(("buy", m)) => match (arg(m, "kind"), arg(m, "offer")) {
+            (Some(kind), Some(offer)) => bridge.buy(&kind, &offer).map(|v| vec![v]),
+            _ => Err(BridgeError::Usage(
+                "buy needs a SERVICE_KIND and an OFFER_ID".into(),
+            )),
         },
         Some(("status", m)) => bridge.status(arg(m, "purchase").as_deref()),
         Some(("resume", _)) => bridge.resume(),
@@ -114,8 +133,9 @@ fn print_view(v: &PurchaseView) {
         v.request_id
     );
     println!(
-        "  service {}  stage {}  provider status {}",
-        v.service,
+        "  service {} offer {}  stage {}  provider status {}",
+        v.service_kind,
+        v.offer_id,
         v.stage.as_str(),
         v.last_status.as_deref().unwrap_or("-")
     );
@@ -129,6 +149,10 @@ fn print_view(v: &PurchaseView) {
         }) => {
             println!("  payment request (simulation; do not open in a wallet, do not pay):");
             println!("    {uri}");
+            match qr(uri) {
+                Some(code) => println!("{code}"),
+                None => println!("    (the request is too long for a QR code)"),
+            }
             println!(
                 "    amount {} ZEC, deadline height {deadline_height} (test data)",
                 format_zec(*amount_zat)
@@ -147,11 +171,12 @@ has not seen yet is still reported as Pending, and a second payment only goes to
         Some(PaymentRequest::Withheld(reason)) => println!("  no payment request: {reason}"),
         None => {}
     }
-    if let Some(i) = &v.install {
-        println!(
-            "  grant installed for blocks [{}, {}) (mock install; no stream is consumed)",
-            i.start_height, i.end_height
-        );
+    match (v.stage, v.entitlement) {
+        (Stage::Redeemed, Some(Entitlement::HeightWindow { start_height, end_height })) => println!(
+            "  grant redeemed for blocks [{start_height}, {end_height}) (mock install; no stream is consumed)"
+        ),
+        (_, Some(e)) => println!("  grant entitlement {e:?}"),
+        _ => {}
     }
     if let Some(n) = &v.note {
         println!("  note: {n}");

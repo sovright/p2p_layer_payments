@@ -1,9 +1,13 @@
-//! Issuer-signed invoices and grants.
+//! Issuer-signed invoices and grants for any paid service.
 //!
 //! The byte format here is a prototype format, not a Zakura wire format. A signed object is
 //! `body || signature`, where the Ed25519 signature covers `domain || 0x00 || body` and the
 //! invoice and grant use different domains, so neither can be replayed as the other.
 //! Signatures are checked with `ed25519-zebra`, which applies the ZIP 215 validation rules.
+//!
+//! Every object names a versioned `service_kind` and the `offer_id` it was bought under. The
+//! terms are typed, and the grant carries the matching entitlement. `service_params` are
+//! opaque here; only the adapter of that service kind reads and validates them.
 
 use ed25519_zebra::Signature;
 pub use ed25519_zebra::{SigningKey, VerificationKey};
@@ -11,19 +15,23 @@ use serde::{Deserialize, Serialize};
 use zcash_protocol::consensus::NetworkType;
 
 /// Signature domain of invoices.
-pub const INVOICE_DOMAIN: &[u8] = b"paid-stream-bridge/prototype/v1/invoice";
+pub const INVOICE_DOMAIN: &[u8] = b"paid-services/prototype/v2/invoice";
 /// Signature domain of grants.
-pub const GRANT_DOMAIN: &[u8] = b"paid-stream-bridge/prototype/v1/grant";
+pub const GRANT_DOMAIN: &[u8] = b"paid-services/prototype/v2/grant";
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 /// Length of the trailing Ed25519 signature.
 pub const SIGNATURE_LEN: usize = 64;
-/// Longest service name, in bytes.
-pub const MAX_SERVICE_LEN: usize = 64;
+/// Longest service kind, in bytes.
+pub const MAX_SERVICE_KIND_LEN: usize = 64;
+/// Longest offer id, in bytes.
+pub const MAX_OFFER_ID_LEN: usize = 64;
 /// Longest destination address, in bytes.
 pub const MAX_DESTINATION_LEN: usize = 512;
 /// Longest memo, in bytes.
 pub const MAX_MEMO_LEN: usize = 512;
+/// Longest `service_params`, in bytes. The service adapter may set a lower limit.
+pub const MAX_SERVICE_PARAMS_LEN: usize = 1024;
 
 /// The Zcash network an object belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +73,42 @@ impl Network {
     }
 }
 
+/// What a purchase buys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Terms {
+    /// Access for this many blocks from issuance.
+    HeightWindow {
+        /// Access length in blocks.
+        blocks: u32,
+    },
+    /// A number of units of the service.
+    Quota {
+        /// Units bought.
+        units: u64,
+    },
+    /// One use.
+    OneShot,
+}
+
+/// What a grant entitles its holder to; it matches the invoice's terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entitlement {
+    /// Access from `start_height` until the provider's tip reaches `end_height` (exclusive).
+    HeightWindow {
+        /// First height of access.
+        start_height: u32,
+        /// Exclusive end height.
+        end_height: u32,
+    },
+    /// A number of units of the service.
+    Quota {
+        /// Units granted.
+        units: u64,
+    },
+    /// One use.
+    OneShot,
+}
+
 /// What the issuer offers: one fixed-price, non-renewing purchase.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invoice {
@@ -76,8 +120,10 @@ pub struct Invoice {
     pub provider_node_id: [u8; 32],
     /// The buying node's NodeId.
     pub client_node_id: [u8; 32],
-    /// The service being bought.
-    pub service: String,
+    /// The versioned service kind, for example `zakura.relay.blockstream/1`.
+    pub service_kind: String,
+    /// The offer the purchase was made under.
+    pub offer_id: String,
     /// The provider's purchase identifier.
     pub purchase_id: [u8; 16],
     /// Price in zatoshis.
@@ -88,10 +134,12 @@ pub struct Invoice {
     pub memo: Vec<u8>,
     /// Inclusive inclusion deadline on the provider's chain.
     pub deadline_height: u32,
-    /// Access length in blocks.
-    pub access_blocks: u32,
     /// Confirmations the issuer waits for before granting.
     pub confirmations: u32,
+    /// What the purchase buys.
+    pub terms: Terms,
+    /// Parameters only the service's adapter reads.
+    pub service_params: Vec<u8>,
 }
 
 /// The issuer's access authorization for one purchase. It is not on-chain proof of payment.
@@ -105,18 +153,18 @@ pub struct Grant {
     pub provider_node_id: [u8; 32],
     /// The buying node's NodeId.
     pub client_node_id: [u8; 32],
-    /// The service bought.
-    pub service: String,
+    /// The versioned service kind.
+    pub service_kind: String,
+    /// The offer the purchase was made under.
+    pub offer_id: String,
     /// The purchase this grant belongs to.
     pub purchase_id: [u8; 16],
     /// The grant's identifier.
     pub grant_id: [u8; 16],
-    /// First height of access.
-    pub start_height: u32,
-    /// Exclusive: access ends when the provider's tip reaches this height.
-    pub end_height: u32,
-    /// Concurrent sessions the grant allows.
-    pub session_allowance: u32,
+    /// What the grant entitles its holder to.
+    pub entitlement: Entitlement,
+    /// The invoice's service parameters, for whoever redeems the grant.
+    pub service_params: Vec<u8>,
 }
 
 /// Why a signed object was refused.
@@ -134,18 +182,48 @@ pub enum CodecError {
     /// Unknown network byte.
     #[error("unknown network byte {0}")]
     BadNetwork(u8),
+    /// Unknown terms or entitlement tag.
+    #[error("unknown terms tag {0}")]
+    BadTerms(u8),
     /// A variable-length field is too long.
     #[error("field {0} is too long")]
     FieldTooLong(&'static str),
     /// A text field is not UTF-8.
     #[error("field {0} is not UTF-8")]
     BadUtf8(&'static str),
+    /// A service kind or offer id has the wrong shape.
+    #[error("field {0} is malformed")]
+    Malformed(&'static str),
     /// The signature does not verify.
     #[error("signature does not verify against the pinned issuer key")]
     BadSignature,
     /// The bytes are not an Ed25519 public key.
     #[error("not a valid Ed25519 public key")]
     BadKey,
+}
+
+/// Whether `kind` is a versioned service kind: `<name>/<version>`, where the name is
+/// lower-case letters, digits, dots and dashes, and the version is decimal digits.
+pub fn is_service_kind(kind: &str) -> bool {
+    let Some((name, version)) = kind.split_once('/') else {
+        return false;
+    };
+    kind.len() <= MAX_SERVICE_KIND_LEN
+        && !name.is_empty()
+        && !version.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && version.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `offer_id` is 1 to 64 letters, digits, dots, dashes or underscores.
+pub fn is_offer_id(offer_id: &str) -> bool {
+    !offer_id.is_empty()
+        && offer_id.len() <= MAX_OFFER_ID_LEN
+        && offer_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
 }
 
 struct Writer(Vec<u8>);
@@ -174,6 +252,50 @@ impl Writer {
         self.0.extend_from_slice(&len.to_be_bytes());
         self.0.extend_from_slice(v);
         Ok(())
+    }
+    fn names(&mut self, service_kind: &str, offer_id: &str) -> Result<(), CodecError> {
+        if !is_service_kind(service_kind) {
+            return Err(CodecError::Malformed("service_kind"));
+        }
+        if !is_offer_id(offer_id) {
+            return Err(CodecError::Malformed("offer_id"));
+        }
+        self.var(
+            "service_kind",
+            service_kind.as_bytes(),
+            MAX_SERVICE_KIND_LEN,
+        )?;
+        self.var("offer_id", offer_id.as_bytes(), MAX_OFFER_ID_LEN)
+    }
+    fn terms(&mut self, terms: &Terms) {
+        match terms {
+            Terms::HeightWindow { blocks } => {
+                self.u8(1);
+                self.u32(*blocks);
+            }
+            Terms::Quota { units } => {
+                self.u8(2);
+                self.u64(*units);
+            }
+            Terms::OneShot => self.u8(3),
+        }
+    }
+    fn entitlement(&mut self, entitlement: &Entitlement) {
+        match entitlement {
+            Entitlement::HeightWindow {
+                start_height,
+                end_height,
+            } => {
+                self.u8(1);
+                self.u32(*start_height);
+                self.u32(*end_height);
+            }
+            Entitlement::Quota { units } => {
+                self.u8(2);
+                self.u64(*units);
+            }
+            Entitlement::OneShot => self.u8(3),
+        }
     }
 }
 
@@ -219,6 +341,38 @@ impl<'a> Reader<'a> {
     fn string(&mut self, name: &'static str, max: usize) -> Result<String, CodecError> {
         String::from_utf8(self.var(name, max)?).map_err(|_| CodecError::BadUtf8(name))
     }
+    fn names(&mut self) -> Result<(String, String), CodecError> {
+        let kind = self.string("service_kind", MAX_SERVICE_KIND_LEN)?;
+        if !is_service_kind(&kind) {
+            return Err(CodecError::Malformed("service_kind"));
+        }
+        let offer = self.string("offer_id", MAX_OFFER_ID_LEN)?;
+        if !is_offer_id(&offer) {
+            return Err(CodecError::Malformed("offer_id"));
+        }
+        Ok((kind, offer))
+    }
+    fn terms(&mut self) -> Result<Terms, CodecError> {
+        match self.u8()? {
+            1 => Ok(Terms::HeightWindow {
+                blocks: self.u32()?,
+            }),
+            2 => Ok(Terms::Quota { units: self.u64()? }),
+            3 => Ok(Terms::OneShot),
+            other => Err(CodecError::BadTerms(other)),
+        }
+    }
+    fn entitlement(&mut self) -> Result<Entitlement, CodecError> {
+        match self.u8()? {
+            1 => Ok(Entitlement::HeightWindow {
+                start_height: self.u32()?,
+                end_height: self.u32()?,
+            }),
+            2 => Ok(Entitlement::Quota { units: self.u64()? }),
+            3 => Ok(Entitlement::OneShot),
+            other => Err(CodecError::BadTerms(other)),
+        }
+    }
     fn finish(self) -> Result<(), CodecError> {
         if self.pos == self.buf.len() {
             Ok(())
@@ -236,7 +390,7 @@ impl Invoice {
         w.raw(&self.issuer_key);
         w.raw(&self.provider_node_id);
         w.raw(&self.client_node_id);
-        w.var("service", self.service.as_bytes(), MAX_SERVICE_LEN)?;
+        w.names(&self.service_kind, &self.offer_id)?;
         w.raw(&self.purchase_id);
         w.u64(self.amount_zat);
         w.var(
@@ -246,27 +400,39 @@ impl Invoice {
         )?;
         w.var("memo", &self.memo, MAX_MEMO_LEN)?;
         w.u32(self.deadline_height);
-        w.u32(self.access_blocks);
         w.u32(self.confirmations);
+        w.terms(&self.terms);
+        w.var(
+            "service_params",
+            &self.service_params,
+            MAX_SERVICE_PARAMS_LEN,
+        )?;
         Ok(w.0)
     }
 
     /// Decodes an unsigned body, refusing trailing bytes.
     pub fn decode_body(bytes: &[u8]) -> Result<Self, CodecError> {
         let mut r = Reader::new(bytes)?;
+        let network = Network::from_byte(r.u8()?)?;
+        let issuer_key = r.array()?;
+        let provider_node_id = r.array()?;
+        let client_node_id = r.array()?;
+        let (service_kind, offer_id) = r.names()?;
         let inv = Invoice {
-            network: Network::from_byte(r.u8()?)?,
-            issuer_key: r.array()?,
-            provider_node_id: r.array()?,
-            client_node_id: r.array()?,
-            service: r.string("service", MAX_SERVICE_LEN)?,
+            network,
+            issuer_key,
+            provider_node_id,
+            client_node_id,
+            service_kind,
+            offer_id,
             purchase_id: r.array()?,
             amount_zat: r.u64()?,
             destination: r.string("destination", MAX_DESTINATION_LEN)?,
             memo: r.var("memo", MAX_MEMO_LEN)?,
             deadline_height: r.u32()?,
-            access_blocks: r.u32()?,
             confirmations: r.u32()?,
+            terms: r.terms()?,
+            service_params: r.var("service_params", MAX_SERVICE_PARAMS_LEN)?,
         };
         r.finish()?;
         Ok(inv)
@@ -281,29 +447,37 @@ impl Grant {
         w.raw(&self.issuer_key);
         w.raw(&self.provider_node_id);
         w.raw(&self.client_node_id);
-        w.var("service", self.service.as_bytes(), MAX_SERVICE_LEN)?;
+        w.names(&self.service_kind, &self.offer_id)?;
         w.raw(&self.purchase_id);
         w.raw(&self.grant_id);
-        w.u32(self.start_height);
-        w.u32(self.end_height);
-        w.u32(self.session_allowance);
+        w.entitlement(&self.entitlement);
+        w.var(
+            "service_params",
+            &self.service_params,
+            MAX_SERVICE_PARAMS_LEN,
+        )?;
         Ok(w.0)
     }
 
     /// Decodes an unsigned body, refusing trailing bytes.
     pub fn decode_body(bytes: &[u8]) -> Result<Self, CodecError> {
         let mut r = Reader::new(bytes)?;
+        let network = Network::from_byte(r.u8()?)?;
+        let issuer_key = r.array()?;
+        let provider_node_id = r.array()?;
+        let client_node_id = r.array()?;
+        let (service_kind, offer_id) = r.names()?;
         let grant = Grant {
-            network: Network::from_byte(r.u8()?)?,
-            issuer_key: r.array()?,
-            provider_node_id: r.array()?,
-            client_node_id: r.array()?,
-            service: r.string("service", MAX_SERVICE_LEN)?,
+            network,
+            issuer_key,
+            provider_node_id,
+            client_node_id,
+            service_kind,
+            offer_id,
             purchase_id: r.array()?,
             grant_id: r.array()?,
-            start_height: r.u32()?,
-            end_height: r.u32()?,
-            session_allowance: r.u32()?,
+            entitlement: r.entitlement()?,
+            service_params: r.var("service_params", MAX_SERVICE_PARAMS_LEN)?,
         };
         r.finish()?;
         Ok(grant)
@@ -381,55 +555,72 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    fn invoice(k: &SigningKey) -> Invoice {
+    fn invoice(k: &SigningKey, terms: Terms) -> Invoice {
         Invoice {
             network: Network::Test,
             issuer_key: public_key_bytes(k),
             provider_node_id: [1; 32],
             client_node_id: [2; 32],
-            service: "svc".into(),
+            service_kind: "example.service/1".into(),
+            offer_id: "offer-1".into(),
             purchase_id: [3; 16],
             amount_zat: 1234,
             destination: "dest".into(),
             memo: b"memo".to_vec(),
             deadline_height: 100,
-            access_blocks: 10,
             confirmations: 3,
+            terms,
+            service_params: vec![1, 2, 3],
         }
     }
 
-    fn grant(k: &SigningKey) -> Grant {
+    fn grant(k: &SigningKey, entitlement: Entitlement) -> Grant {
         Grant {
             network: Network::Test,
             issuer_key: public_key_bytes(k),
             provider_node_id: [1; 32],
             client_node_id: [2; 32],
-            service: "svc".into(),
+            service_kind: "example.service/1".into(),
+            offer_id: "offer-1".into(),
             purchase_id: [3; 16],
             grant_id: [4; 16],
-            start_height: 50,
-            end_height: 60,
-            session_allowance: 1,
+            entitlement,
+            service_params: vec![1, 2, 3],
         }
     }
 
     #[test]
-    fn invoice_and_grant_round_trip() {
+    fn every_terms_and_entitlement_kind_round_trips() {
         let k = key(7);
         let vk = k.verification_key();
-        let inv = invoice(&k);
-        let signed = sign_invoice(&inv, &k).unwrap();
-        assert_eq!(verify_invoice(&signed, &vk).unwrap(), inv);
-        let g = grant(&k);
-        let signed = sign_grant(&g, &k).unwrap();
-        assert_eq!(verify_grant(&signed, &vk).unwrap(), g);
+        for terms in [
+            Terms::HeightWindow { blocks: 10 },
+            Terms::Quota { units: 5 },
+            Terms::OneShot,
+        ] {
+            let inv = invoice(&k, terms);
+            let signed = sign_invoice(&inv, &k).unwrap();
+            assert_eq!(verify_invoice(&signed, &vk).unwrap(), inv);
+        }
+        for entitlement in [
+            Entitlement::HeightWindow {
+                start_height: 50,
+                end_height: 60,
+            },
+            Entitlement::Quota { units: 5 },
+            Entitlement::OneShot,
+        ] {
+            let g = grant(&k, entitlement);
+            let signed = sign_grant(&g, &k).unwrap();
+            assert_eq!(verify_grant(&signed, &vk).unwrap(), g);
+        }
     }
 
     #[test]
     fn wrong_key_and_tampering_fail() {
         let k = key(7);
         let vk = k.verification_key();
-        let signed = sign_invoice(&invoice(&k), &k).unwrap();
+        let signed = sign_invoice(&invoice(&k, Terms::OneShot), &k).unwrap();
         assert_eq!(
             verify_invoice(&signed, &key(8).verification_key()),
             Err(CodecError::BadSignature)
@@ -451,13 +642,14 @@ mod tests {
     fn domains_do_not_cross() {
         let k = key(7);
         let vk = k.verification_key();
-        // A grant body signed in the invoice domain is not a grant, and the reverse.
-        let in_invoice_domain = sign(INVOICE_DOMAIN, &grant(&k).encode_body().unwrap(), &k);
+        let g = grant(&k, Entitlement::OneShot);
+        let in_invoice_domain = sign(INVOICE_DOMAIN, &g.encode_body().unwrap(), &k);
         assert_eq!(
             verify_grant(&in_invoice_domain, &vk),
             Err(CodecError::BadSignature)
         );
-        let in_grant_domain = sign(GRANT_DOMAIN, &invoice(&k).encode_body().unwrap(), &k);
+        let inv = invoice(&k, Terms::OneShot);
+        let in_grant_domain = sign(GRANT_DOMAIN, &inv.encode_body().unwrap(), &k);
         assert_eq!(
             verify_invoice(&in_grant_domain, &vk),
             Err(CodecError::BadSignature)
@@ -465,20 +657,37 @@ mod tests {
     }
 
     #[test]
-    fn strict_decoding() {
+    fn strict_decoding_and_names() {
         let k = key(7);
-        let mut body = invoice(&k).encode_body().unwrap();
+        let mut body = invoice(&k, Terms::OneShot).encode_body().unwrap();
         body.push(0);
         let signed = sign(INVOICE_DOMAIN, &body, &k);
         assert_eq!(
             verify_invoice(&signed, &k.verification_key()),
             Err(CodecError::TrailingBytes)
         );
-        let mut long = invoice(&k);
-        long.service = "x".repeat(MAX_SERVICE_LEN + 1);
-        assert_eq!(long.encode_body(), Err(CodecError::FieldTooLong("service")));
-        let mut body = invoice(&k).encode_body().unwrap();
-        body[0] = 9;
-        assert_eq!(Invoice::decode_body(&body), Err(CodecError::BadVersion(9)));
+        let mut bad = invoice(&k, Terms::OneShot);
+        bad.service_kind = "Relay".into();
+        assert_eq!(
+            bad.encode_body(),
+            Err(CodecError::Malformed("service_kind"))
+        );
+        let mut bad = invoice(&k, Terms::OneShot);
+        bad.offer_id = String::new();
+        assert_eq!(bad.encode_body(), Err(CodecError::Malformed("offer_id")));
+        let mut big = invoice(&k, Terms::OneShot);
+        big.service_params = vec![0; MAX_SERVICE_PARAMS_LEN + 1];
+        assert_eq!(
+            big.encode_body(),
+            Err(CodecError::FieldTooLong("service_params"))
+        );
+        let mut body = invoice(&k, Terms::OneShot).encode_body().unwrap();
+        body[0] = 1;
+        assert_eq!(Invoice::decode_body(&body), Err(CodecError::BadVersion(1)));
+        assert!(is_service_kind("zakura.relay.blockstream/1"));
+        assert!(!is_service_kind("zakura.relay.blockstream"));
+        assert!(!is_service_kind("zakura.relay/v1"));
+        assert!(is_offer_id("relay-10"));
+        assert!(!is_offer_id("relay 10"));
     }
 }

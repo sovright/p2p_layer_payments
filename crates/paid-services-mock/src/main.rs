@@ -166,7 +166,10 @@ fn node(m: &ArgMatches) -> i32 {
         node.addr
     );
     println!("sidecar config: {}", cfg_path.display());
-    println!("services (test data): synthetic-10 (25000 zat, 10 blocks), synthetic-20 (40000 zat, 20 blocks)");
+    println!(
+        "offers (test data): {} relay-10 (25000 zat, 10 blocks), relay-20 (40000 zat, 20 blocks)",
+        paid_services_relay::SERVICE_KIND
+    );
     let _ = std::io::stdout().flush();
     match m.get_one::<u64>("serve-secs") {
         Some(s) => std::thread::sleep(Duration::from_secs(*s)),

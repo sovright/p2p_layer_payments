@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use paid_services_types::{hex_array, hex_bytes};
 
 /// The state file format version.
-pub const STATE_FORMAT: u32 = 1;
+pub const STATE_FORMAT: u32 = 2;
 
 /// Where a purchase stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,10 +25,11 @@ pub enum Stage {
     Invoiced,
     /// The invoice or the provider's answer failed a check. Never shown as a payment request.
     Rejected,
-    /// A verified grant is stored but not yet installed on the node.
+    /// A verified grant is stored but not yet redeemed.
     Granted,
-    /// The node accepted the grant (in this prototype, a mock install).
-    Installed,
+    /// The grant was redeemed the way its service says (for the relay stream, a mock install on
+    /// the node).
+    Redeemed,
     /// The provider reported the purchase as expired.
     Expired,
 }
@@ -38,7 +39,7 @@ impl Stage {
     pub fn is_open(self) -> bool {
         matches!(
             self,
-            Stage::Requested | Stage::Invoiced | Stage::Granted | Stage::Installed
+            Stage::Requested | Stage::Invoiced | Stage::Granted | Stage::Redeemed
         )
     }
 
@@ -49,20 +50,10 @@ impl Stage {
             Stage::Invoiced => "invoiced",
             Stage::Rejected => "rejected",
             Stage::Granted => "granted",
-            Stage::Installed => "installed",
+            Stage::Redeemed => "redeemed",
             Stage::Expired => "expired",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-/// The heights of an installed grant.
-pub struct Install {
-    /// First height of access.
-    pub start_height: u32,
-    /// Exclusive end height.
-    pub end_height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,8 +62,10 @@ pub struct Install {
 pub struct Purchase {
     /// The request_id (hex), written before the invoice request goes out.
     pub request_id: String,
-    /// The service bought.
-    pub service: String,
+    /// The versioned service kind.
+    pub service_kind: String,
+    /// The offer bought.
+    pub offer_id: String,
     /// Where the purchase stands.
     pub stage: Stage,
     /// The provider's purchase id (hex).
@@ -87,9 +80,6 @@ pub struct Purchase {
     /// Signed grant bytes, hex, exactly as received.
     #[serde(default)]
     pub grant: Option<String>,
-    /// The installed grant's heights.
-    #[serde(default)]
-    pub install: Option<Install>,
     /// A note about the last step.
     #[serde(default)]
     pub note: Option<String>,
@@ -233,8 +223,8 @@ fn load(path: &Path) -> Result<StateFile, StateError> {
 
 fn validate(p: &Purchase) -> Result<(), String> {
     hex_array::<16>(&p.request_id).map_err(|e| format!("request_id: {e}"))?;
-    if p.service.is_empty() {
-        return Err("service is empty".into());
+    if p.service_kind.is_empty() || p.offer_id.is_empty() {
+        return Err("service kind or offer id is empty".into());
     }
     if let Some(pid) = &p.purchase_id {
         hex_array::<16>(pid).map_err(|e| format!("purchase_id: {e}"))?;
@@ -255,10 +245,7 @@ fn validate(p: &Purchase) -> Result<(), String> {
         Stage::Requested | Stage::Rejected => Ok(()),
         Stage::Invoiced => needs(p.invoice.is_some() && p.purchase_id.is_some(), "an invoice"),
         Stage::Granted => needs(p.invoice.is_some() && p.grant.is_some(), "a grant"),
-        Stage::Installed => needs(
-            p.invoice.is_some() && p.grant.is_some() && p.install.is_some(),
-            "an installed grant",
-        ),
+        Stage::Redeemed => needs(p.invoice.is_some() && p.grant.is_some(), "a redeemed grant"),
         Stage::Expired => needs(p.purchase_id.is_some(), "a purchase_id"),
     }
 }

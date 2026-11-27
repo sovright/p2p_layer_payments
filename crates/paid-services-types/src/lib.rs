@@ -13,6 +13,8 @@ pub mod codec;
 pub mod config;
 pub mod contract;
 pub mod expiry;
+pub mod rpc;
+pub mod service;
 pub mod uri;
 
 /// Decodes a hex string.
