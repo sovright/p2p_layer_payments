@@ -4,17 +4,18 @@
 //! is always retried with the same request_id. Nothing here deletes files: a write replaces
 //! the state file by renaming a fully written and synced temporary file over it.
 
-use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hexutil;
+use paid_services_types::{hex_array, hex_bytes};
 
+/// The state file format version.
 pub const STATE_FORMAT: u32 = 1;
 
+/// Where a purchase stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -33,6 +34,7 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Whether the purchase still needs work.
     pub fn is_open(self) -> bool {
         matches!(
             self,
@@ -40,6 +42,7 @@ impl Stage {
         )
     }
 
+    /// The stage's name as written in the state file.
     pub fn as_str(self) -> &'static str {
         match self {
             Stage::Requested => "requested",
@@ -54,37 +57,51 @@ impl Stage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// The heights of an installed grant.
 pub struct Install {
+    /// First height of access.
     pub start_height: u32,
+    /// Exclusive end height.
     pub end_height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// One purchase in the state file.
 pub struct Purchase {
+    /// The request_id (hex), written before the invoice request goes out.
     pub request_id: String,
+    /// The service bought.
     pub service: String,
+    /// Where the purchase stands.
     pub stage: Stage,
+    /// The provider's purchase id (hex).
     #[serde(default)]
     pub purchase_id: Option<String>,
     /// Signed invoice bytes, hex, exactly as received.
     #[serde(default)]
     pub invoice: Option<String>,
+    /// The provider's last reported status.
     #[serde(default)]
     pub last_status: Option<String>,
     /// Signed grant bytes, hex, exactly as received.
     #[serde(default)]
     pub grant: Option<String>,
+    /// The installed grant's heights.
     #[serde(default)]
     pub install: Option<Install>,
+    /// A note about the last step.
     #[serde(default)]
     pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// The whole state file.
 pub struct StateFile {
+    /// Format version.
     pub format: u32,
+    /// Every purchase, oldest first.
     pub purchases: Vec<Purchase>,
 }
 
@@ -97,33 +114,26 @@ impl Default for StateFile {
     }
 }
 
-#[derive(Debug)]
+/// Why the state could not be opened or saved.
+#[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    /// Another process holds the lock.
+    #[error("another sidecar process holds the lock {}; nothing was changed", .0.display())]
     Locked(PathBuf),
-    Corrupt { path: PathBuf, reason: String },
+    /// The state file is unreadable or inconsistent; it is left untouched.
+    #[error("state file {} is unreadable ({reason}); it was left untouched and nothing was changed", path.display())]
+    Corrupt {
+        /// The state file.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// An I/O error.
+    #[error("state file error: {0}")]
     Io(String),
 }
 
-impl fmt::Display for StateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StateError::Locked(p) => write!(
-                f,
-                "another bridge process holds the lock {}; nothing was changed",
-                p.display()
-            ),
-            StateError::Corrupt { path, reason } => write!(
-                f,
-                "state file {} is unreadable ({reason}); it was left untouched and nothing was changed",
-                path.display()
-            ),
-            StateError::Io(e) => write!(f, "state file error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for StateError {}
-
+/// The lock file next to a state file.
 pub fn lock_path(state: &Path) -> PathBuf {
     sibling(state, ".lock")
 }
@@ -144,6 +154,8 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    /// Takes the lock and loads the state. Fails if another process holds the lock or the
+    /// file is unreadable.
     pub fn open(path: &Path) -> Result<(Self, StateFile), StateError> {
         let lock_file_path = lock_path(path);
         let lock = OpenOptions::new()
@@ -169,6 +181,7 @@ impl StateStore {
         ))
     }
 
+    /// The state file path.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -219,16 +232,16 @@ fn load(path: &Path) -> Result<StateFile, StateError> {
 }
 
 fn validate(p: &Purchase) -> Result<(), String> {
-    hexutil::decode_array::<16>(&p.request_id).map_err(|e| format!("request_id: {e}"))?;
+    hex_array::<16>(&p.request_id).map_err(|e| format!("request_id: {e}"))?;
     if p.service.is_empty() {
         return Err("service is empty".into());
     }
     if let Some(pid) = &p.purchase_id {
-        hexutil::decode_array::<16>(pid).map_err(|e| format!("purchase_id: {e}"))?;
+        hex_array::<16>(pid).map_err(|e| format!("purchase_id: {e}"))?;
     }
     for (name, field) in [("invoice", &p.invoice), ("grant", &p.grant)] {
         if let Some(h) = field {
-            hexutil::decode(h).map_err(|e| format!("{name}: {e}"))?;
+            hex_bytes(h).map_err(|e| format!("{name}: {e}"))?;
         }
     }
     let needs = |cond: bool, what: &str| {

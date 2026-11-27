@@ -4,9 +4,9 @@ Prototypes for paying for services over Zakura's P2P layer, for example paying i
 
 This is early prototype work. Nothing here moves real funds.
 
-## paid-stream-bridge (prototype, simulation only)
+## paid-services sidecar (prototype, simulation only)
 
-> **SIMULATION ONLY.** This bridge talks to a **mock node** and a **mock issuer**.
+> **SIMULATION ONLY.** This sidecar talks to a **mock node** and a **mock issuer**.
 > - It opens no wallet and starts no payment.
 > - It holds no seed, spending key, viewing key or wallet credential.
 > - It talks to no real Zakura node.
@@ -15,7 +15,7 @@ This is early prototype work. Nothing here moves real funds.
 >
 > **Wallet expiry support is not solved.** No wallet examined can set a transaction's `nExpiryHeight` from a payment request. This prototype does not work around that.
 
-The prototype explores a standalone bridge between a user's own Zcash wallet and a Zakura node that buys access to a provider's paid stream.
+The prototype explores a standalone sidecar (the "bridge") between a user's own Zcash wallet and a Zakura node that buys access to a provider's paid stream.
 
 ### What it is and is not
 
@@ -35,35 +35,36 @@ The prototype explores a standalone bridge between a user's own Zcash wallet and
 ### Commands
 
 ```
-paid-stream-bridge --config FILE buy SERVICE        # new purchase, or continue the open one for SERVICE
-paid-stream-bridge --config FILE status [PURCHASE]  # ask the provider (through the node) for the status
-paid-stream-bridge --config FILE resume             # finish what a lost answer or a restart left open
-paid-stream-bridge --config FILE show PURCHASE      # show a still-pending payment request again
+paid-services-sidecar --config FILE buy SERVICE        # new purchase, or continue the open one for SERVICE
+paid-services-sidecar --config FILE status [PURCHASE]  # ask the provider (through the node) for the status
+paid-services-sidecar --config FILE resume             # finish what a lost answer or a restart left open
+paid-services-sidecar --config FILE show PURCHASE      # show a still-pending payment request again
 ```
 
 The mock side:
 
 ```
-paid-stream-bridge mock-node --dir NEW_DIR [--port PORT] [--serve-secs SECS]
-paid-stream-bridge mock-control --config FILE pay PURCHASE_ID [--amount ZAT] [--expiry HEIGHT]
-paid-stream-bridge mock-control --config FILE mine BLOCKS
-paid-stream-bridge mock-control --config FILE drop-next METHOD
-paid-stream-bridge mock-control --config FILE tamper MODE
+paid-services-mock node --dir NEW_DIR [--port PORT] [--serve-secs SECS]
+paid-services-mock control --config FILE pay PURCHASE_ID [--amount ZAT] [--expiry HEIGHT]
+paid-services-mock control --config FILE mine BLOCKS
+paid-services-mock control --config FILE drop-next METHOD
+paid-services-mock control --config FILE tamper MODE
 ```
 
 #### Demo
 
 ```
-paid-stream-bridge mock-node --dir /tmp/psb-demo-1 --serve-secs 600 &
-paid-stream-bridge --config /tmp/psb-demo-1/bridge.json buy synthetic-10
-paid-stream-bridge mock-control --config /tmp/psb-demo-1/bridge.json pay <purchase_id>
-paid-stream-bridge mock-control --config /tmp/psb-demo-1/bridge.json mine 2
-paid-stream-bridge --config /tmp/psb-demo-1/bridge.json status
+cargo build --workspace
+target/debug/paid-services-mock node --dir /tmp/psb-demo-1 --serve-secs 600 &
+target/debug/paid-services-sidecar --config /tmp/psb-demo-1/sidecar.json buy synthetic-10
+target/debug/paid-services-mock control --config /tmp/psb-demo-1/sidecar.json pay <purchase_id>
+target/debug/paid-services-mock control --config /tmp/psb-demo-1/sidecar.json mine 2
+target/debug/paid-services-sidecar --config /tmp/psb-demo-1/sidecar.json status
 ```
 
-`mock-node` refuses to overwrite an existing cookie or config, so each demo uses a new directory.
+`paid-services-mock node` refuses to overwrite an existing cookie or config, so each demo uses a new directory.
 
-### What the bridge checks
+### What the sidecar checks
 
 **Invoice** (signed in the invoice domain, `verify_strict` against the pinned key):
 - network, issuer key, provider NodeId;
@@ -80,7 +81,7 @@ paid-stream-bridge --config /tmp/psb-demo-1/bridge.json status
 - the provider still reports the purchase as `Pending`, which means it has seen no payment;
 - the offer window is open: `tip + 1 + expiry_delta + offer_margin_blocks <= deadline`.
 
-`expiry_delta` comes from an explicit wallet expiry profile (`wallet_expiry_profile` in the config, see `src/expiry.rs`). The only profile, `librustzcash-default`, was read from the source of zecd 0.10.0, Vizor v0.0.66 and Zodl's librustzcash:
+`expiry_delta` comes from an explicit wallet expiry profile (`wallet_expiry_profile` in the config, see `crates/paid-services-types/src/expiry.rs`). The only profile, `librustzcash-default`, was read from the source of zecd 0.10.0, Vizor v0.0.66 and Zodl's librustzcash:
 - the target height plus 40 blocks before NU7;
 - plus 120 blocks from NU7.
 
@@ -114,7 +115,7 @@ Otherwise the request is withheld. The local height is only ever used to withhol
 
 ### Proposed contract error codes
 
-These are prototype values, defined in `src/contract.rs` and shared by the bridge and the mock node. They are not Zakura error codes.
+These are prototype values, defined in `crates/paid-services-types/src/contract.rs` and shared by the sidecar and the mock node. They are not Zakura error codes.
 
 | Code | Name | Effect on a `paidstream_requestinvoice` purchase |
 |---|---|---|
@@ -138,22 +139,48 @@ Zakura answers handler errors with HTTP 200 (`zakura-rpc/src/server/http.rs:180`
 - **No wallet result reaches the bridge.** QR and deep-link wallets return nothing to the caller, so the bridge cannot detect a lost wallet answer.
 - **The real node side does not exist yet:** the three RPCs, the paid-stream P2P service, grant persistence in the node, and capability allocation.
 
+### Layout
+
+The workspace mirrors Zakura's `crates/` layout, so it can move into that tree later.
+
+| Crate | What it holds |
+|---|---|
+| `crates/paid-services-types` | Sync-only, no I/O: the signed invoice and grant codec, the checks, the contract error codes, the ZIP 321 code, the wallet expiry profile and the sidecar config type. |
+| `crates/paid-services-sidecar` | The `paid-services-sidecar` CLI, the durable state file and the node RPC client. |
+| `crates/paid-services-mock` | The mock node and issuer, and the `paid-services-mock` CLI. Used only by tests and the demo. |
+
+Workspace settings follow zakura-core/zakura (main `cb148173`):
+- `edition = "2021"`, `rust-version = "1.97"`;
+- `license = "MIT OR Apache-2.0"`;
+- `[workspace.lints]` copied from Zakura, so `unsafe_code` is denied and `missing_docs`, `print_stdout`, `print_stderr` and `unwrap_in_result` warn.
+
+Dependencies are Zakura's, at Zakura's versions:
+- `ed25519-zebra` 4.2 for the issuer signatures;
+- Zakura's forks `zakura-address` and `zakura-protocol` 5.4.0, renamed to `zcash_address` and `zcash_protocol` as Zakura does;
+- `serde`, `serde_json`, `thiserror`, `hex`, `base64`, `rand_core` 0.6, and `clap` 4 without default features.
+
+The one dependency Zakura does not have is `zakura-zip321` 5.4.0, Zakura's own fork of the ZIP 321 parser from zakura-core/common. It is built on the same forked address crates, so there is no second copy of the upstream address crates.
+
+`serde` and `thiserror` are locked to the versions in Zakura's `Cargo.lock`, so the tree has a single `syn`.
+
+The loopback JSON-RPC client and the mock server use `std`; there is no async runtime or HTTP framework.
+
 ### Build and test
 
-Dependency choice:
-- Rust, like Zakura and zecd.
-- `ed25519-dalek` for the issuer signatures.
-- `zip321`, `zcash_address` and `zcash_protocol`: the reference ZIP 321 parser and the address crates it uses.
-- `serde` and `serde_json` for config, state and JSON-RPC.
-- `base64`, already pulled in by `zip321`.
-
-There is no async runtime, HTTP framework or argument-parser dependency. The loopback JSON-RPC client and mock server use `std`.
-
-Commands:
-
 ```
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
 ```
 
 Tests write only under `target/tmp`, each in a new directory, and delete nothing.
+
+The CI workflow (`.github/workflows/ci.yml`) runs fmt, clippy, the workspace tests, an MSRV check and the supply-chain checks:
+- **cargo-deny:** `cargo deny --workspace check bans licenses sources`, with Zakura's policy in `deny.toml`.
+- **cargo-vet:** `cargo vet check --store-path ./qa/supply-chain/`. It imports the same audits as Zakura, plus Zakura's own audits, with no exemptions.
+
+Neither supply-chain check has been run locally. A crate without an imported audit fails `cargo vet` until an audit, an exemption or a dependency change is decided.
+
+### License
+
+Licensed under either of Apache License, Version 2.0 (`LICENSE-APACHE`) or MIT license (`LICENSE-MIT`), at your option.

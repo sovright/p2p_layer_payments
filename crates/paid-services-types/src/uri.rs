@@ -87,7 +87,10 @@ pub fn verify_payment_uri(uri: &str, inv: &Invoice, network: Network) -> Result<
             payments.len()
         ));
     }
-    let payment = payments.values().next().expect("one payment");
+    let payment = payments
+        .values()
+        .next()
+        .ok_or("payment request has no payment")?;
     let address = payment.recipient_address().encode();
     if address != inv.destination {
         return Err("payment request address differs from the invoice".into());

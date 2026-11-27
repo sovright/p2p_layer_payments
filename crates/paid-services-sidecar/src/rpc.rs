@@ -5,7 +5,6 @@
 //! [`RpcError::Transport`]: the outcome is unknown, and the caller must retry the same request
 //! rather than start a new one.
 
-use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
@@ -14,31 +13,31 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 
+/// Largest HTTP header accepted.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// Largest HTTP body accepted.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why a node call failed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RpcError {
     /// No complete answer arrived. The request may or may not have been processed.
+    #[error("no answer from the node ({0})")]
     Transport(String),
     /// The node answered with a JSON-RPC error.
-    Rpc { code: i64, message: String },
+    #[error("node error {code}: {message}")]
+    Rpc {
+        /// The JSON-RPC error code.
+        code: i64,
+        /// The error message.
+        message: String,
+    },
     /// The node answered with something that is not a JSON-RPC response.
+    #[error("unexpected answer from the node: {0}")]
     Protocol(String),
 }
 
-impl fmt::Display for RpcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RpcError::Transport(e) => write!(f, "no answer from the node ({e})"),
-            RpcError::Rpc { code, message } => write!(f, "node error {code}: {message}"),
-            RpcError::Protocol(e) => write!(f, "unexpected answer from the node: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for RpcError {}
-
+/// A JSON-RPC client for the local node.
 #[derive(Clone, Debug)]
 pub struct RpcClient {
     addr: SocketAddr,
@@ -47,6 +46,7 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    /// A client for a loopback address, authenticating with `cookie`.
     pub fn new(addr: SocketAddr, cookie: &str) -> Result<Self, String> {
         if !addr.ip().is_loopback() {
             return Err(format!(
@@ -64,16 +64,19 @@ impl RpcClient {
         })
     }
 
+    /// A client that reads its cookie from a file.
     pub fn from_cookie_file(addr: SocketAddr, path: &Path) -> Result<Self, String> {
         let cookie = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read cookie file {}: {e}", path.display()))?;
         Self::new(addr, &cookie)
     }
 
+    /// The node address.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
+    /// Calls `method` with `params` and returns the result.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let body =
             json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
@@ -132,13 +135,18 @@ impl RpcClient {
     }
 }
 
+/// One HTTP/1.1 message.
 pub struct HttpMessage {
+    /// The request or status line.
     pub start_line: String,
+    /// Header names and values.
     pub headers: Vec<(String, String)>,
+    /// The body.
     pub body: Vec<u8>,
 }
 
 impl HttpMessage {
+    /// The first header with this name, case-insensitively.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -226,21 +234,6 @@ pub fn read_http_message(stream: &mut impl Read, max_body: usize) -> io::Result<
         }
     }
     Ok(HttpMessage { body, ..message })
-}
-
-pub fn write_http_response(
-    stream: &mut impl Write,
-    status: u16,
-    reason: &str,
-    body: &[u8],
-) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

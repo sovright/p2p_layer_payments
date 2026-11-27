@@ -18,38 +18,58 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde_json::{json, Value};
 use zcash_address::unified::{self, Encoding as _};
 
-use crate::codec::{self, Grant, Invoice, Network, GRANT_DOMAIN, INVOICE_DOMAIN, SIGNATURE_LEN};
-use crate::expiry::LIBRUSTZCASH_DEFAULT;
-use crate::hexutil;
-use crate::rpc::{read_http_message, write_http_response};
+use paid_services_types::codec::{
+    self, Grant, Invoice, Network, SigningKey, VerificationKey, GRANT_DOMAIN, INVOICE_DOMAIN,
+    SIGNATURE_LEN,
+};
+use paid_services_types::expiry::LIBRUSTZCASH_DEFAULT;
+use paid_services_types::{hex_array, hex_bytes};
 
+use crate::http::{read_http_message, write_http_response};
+
+pub mod http;
+
+/// Seed of the mock issuer's signing key (test data).
 pub const TEST_ISSUER_SEED: [u8; 32] = *b"paid-stream-bridge test issuer!!";
+/// Seed of a second key, used to forge signatures in tests.
 pub const OTHER_ISSUER_SEED: [u8; 32] = [0x77; 32];
+/// The mock provider's NodeId (test data).
 pub const TEST_PROVIDER_NODE_ID: [u8; 32] = [0x50; 32];
+/// The NodeId the mock node claims for itself (test data).
 pub const TEST_CLIENT_NODE_ID: [u8; 32] = [0xc1; 32];
+/// Another client NodeId, for binding tests.
 pub const OTHER_CLIENT_NODE_ID: [u8; 32] = [0xc2; 32];
 
-pub use crate::contract::{CODE_INVALID_GRANT, CODE_MOCK_CONTROL, CODE_REJECTED};
+pub use paid_services_types::contract::{CODE_INVALID_GRANT, CODE_MOCK_CONTROL, CODE_REJECTED};
 
+/// A service the mock issuer sells (test data).
 #[derive(Clone, Debug)]
 pub struct MockService {
+    /// Service name.
     pub name: String,
+    /// Price in zatoshis.
     pub price_zat: u64,
+    /// Access length in blocks.
     pub access_blocks: u32,
 }
 
 /// Test data for the mock issuer.
 #[derive(Clone, Debug)]
 pub struct MockParams {
+    /// Network of the mock chain.
     pub network: Network,
+    /// Chain tip at start.
     pub start_tip: u32,
+    /// Blocks between the tip and an invoice's deadline.
     pub deadline_margin: u32,
+    /// Confirmations before a grant.
     pub confirmations: u32,
+    /// Sessions a grant allows.
     pub session_allowance: u32,
+    /// Services on sale.
     pub services: Vec<MockService>,
 }
 
@@ -80,21 +100,34 @@ impl Default for MockParams {
 /// Ways the mock node can corrupt an answer, to test the bridge's checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tamper {
+    /// Honest answers.
     None,
+    /// Invoices signed with another key.
     InvoiceWrongKey,
+    /// Invoices signed in the grant domain.
     InvoiceGrantDomain,
+    /// Invoices for another network, signed by the issuer.
     InvoiceWrongNetwork,
+    /// Invoices naming another provider, signed by the issuer.
     InvoiceWrongProvider,
+    /// Invoices bound to another client, signed by the issuer.
     InvoiceWrongClient,
+    /// Invoices for another service, signed by the issuer.
     InvoiceWrongService,
+    /// Grants signed with another key.
     GrantWrongKey,
+    /// Grants signed in the invoice domain.
     GrantInvoiceDomain,
+    /// Grants bound to another client, signed by the issuer.
     GrantOtherClient,
+    /// `Issued` without a grant.
     IssuedWithoutGrant,
+    /// A recorded invoice request answered with bad hex.
     MalformedInvoiceAnswer,
 }
 
 impl Tamper {
+    /// Control names of the modes.
     pub const NAMES: &'static [(&'static str, Tamper)] = &[
         ("none", Tamper::None),
         ("invoice-wrong-key", Tamper::InvoiceWrongKey),
@@ -110,52 +143,68 @@ impl Tamper {
         ("malformed-invoice-answer", Tamper::MalformedInvoiceAnswer),
     ];
 
+    /// The mode with this control name.
     pub fn parse(s: &str) -> Option<Tamper> {
         Self::NAMES.iter().find(|(n, _)| *n == s).map(|(_, t)| *t)
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why the mock issuer refused a request.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MockError {
+    /// The request_id was used before with other terms.
+    #[error("RequestConflict: this request_id was already used with other terms")]
     RequestConflict,
+    /// The mock offers no such service.
+    #[error("UnknownService: {0:?}")]
     UnknownService(String),
+    /// No such purchase.
+    #[error("unknown purchase")]
     UnknownPurchase,
+    /// The purchase already has a payment.
+    #[error("the mock records one payment per purchase")]
     AlreadyPaid,
+    /// A signed object could not be encoded.
+    #[error("encoding failed: {0}")]
+    Encode(codec::CodecError),
 }
 
 impl MockError {
     fn code(&self) -> i64 {
         match self {
             MockError::RequestConflict | MockError::UnknownService(_) => CODE_REJECTED,
-            MockError::UnknownPurchase | MockError::AlreadyPaid => CODE_MOCK_CONTROL,
+            MockError::UnknownPurchase | MockError::AlreadyPaid | MockError::Encode(_) => {
+                CODE_MOCK_CONTROL
+            }
         }
     }
 
     fn message(&self) -> String {
-        match self {
-            MockError::RequestConflict => {
-                "RequestConflict: this request_id was already used with other terms".into()
-            }
-            MockError::UnknownService(s) => format!("UnknownService: {s:?}"),
-            MockError::UnknownPurchase => "unknown purchase".into(),
-            MockError::AlreadyPaid => "the mock records one payment per purchase".into(),
-        }
+        self.to_string()
     }
 }
 
 /// What `paidstream_getgrant` reports, following the proposal's status table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MockStatus {
+    /// Unknown, or bound to another client.
     NotFound,
+    /// No payment seen.
     Pending,
+    /// A qualifying payment short of its confirmations.
     PaymentSeen,
+    /// A payment below the price.
     Underpaid,
+    /// A payment that breaks the deadline rule.
     NeedsReconciliation,
+    /// Granted; the signed grant.
     Issued(Vec<u8>),
+    /// Expired, with the grant if one was issued.
     Expired(Option<Vec<u8>>),
 }
 
 impl MockStatus {
+    /// The status name on the wire.
     pub fn name(&self) -> &'static str {
         match self {
             MockStatus::NotFound => "NotFound",
@@ -168,10 +217,11 @@ impl MockStatus {
         }
     }
 
+    /// The `paidstream_getgrant` answer.
     pub fn to_json(&self) -> Value {
         match self {
             MockStatus::Issued(g) | MockStatus::Expired(Some(g)) => {
-                json!({"status": self.name(), "grant": hexutil::encode(g)})
+                json!({"status": self.name(), "grant": hex::encode(g)})
             }
             _ => json!({"status": self.name()}),
         }
@@ -267,20 +317,19 @@ fn qualifies(p: &Payment, inv: &Invoice) -> bool {
 pub fn mock_destination(network: Network, index: u64) -> String {
     let mut receiver = [0xffu8; 43];
     receiver[..8].copy_from_slice(&index.to_be_bytes());
-    let ua = unified::Address::try_from_items(
-        unified::Revision::R0,
-        vec![unified::Uitem::Data(unified::Receiver::Orchard(receiver))],
-    )
-    .expect("one Orchard receiver is a valid unified address");
+    let ua = unified::Address::try_from_items(vec![unified::Receiver::Orchard(receiver)])
+        .expect("one Orchard receiver is a valid unified address");
     ua.encode(&network.network_type())
 }
 
+/// The mock issuer: sells services, observes mock payments and signs invoices and grants.
 #[derive(Clone)]
 pub struct MockIssuer {
     inner: Arc<Mutex<IssuerState>>,
 }
 
 impl MockIssuer {
+    /// A new issuer with the test signing key.
     pub fn new(params: MockParams) -> Self {
         let tip = params.start_tip;
         MockIssuer {
@@ -298,22 +347,27 @@ impl MockIssuer {
         self.inner.lock().expect("mock issuer lock")
     }
 
+    /// The issuer's public key.
     pub fn public_key(&self) -> [u8; 32] {
-        self.lock().key.verifying_key().to_bytes()
+        codec::public_key_bytes(&self.lock().key)
     }
 
+    /// Network of the mock chain.
     pub fn network(&self) -> Network {
         self.lock().params.network
     }
 
+    /// The mock chain tip.
     pub fn tip(&self) -> u32 {
         self.lock().tip
     }
 
+    /// How many purchases the issuer recorded.
     pub fn invoices_created(&self) -> usize {
         self.lock().records.len()
     }
 
+    /// Mines `blocks` blocks and issues due grants. Returns the new tip.
     pub fn mine(&self, blocks: u32) -> u32 {
         let mut s = self.lock();
         s.tip += blocks;
@@ -348,19 +402,19 @@ impl MockIssuer {
         purchase_id[8..].copy_from_slice(&index.to_be_bytes());
         let invoice = Invoice {
             network: s.params.network,
-            issuer_key: s.key.verifying_key().to_bytes(),
+            issuer_key: codec::public_key_bytes(&s.key),
             provider_node_id: TEST_PROVIDER_NODE_ID,
             client_node_id: client,
             service: service.to_string(),
             purchase_id,
             amount_zat: offer.price_zat,
             destination: mock_destination(s.params.network, index),
-            memo: format!("psb-mock {}", hexutil::encode(&purchase_id)).into_bytes(),
+            memo: format!("psb-mock {}", hex::encode(purchase_id)).into_bytes(),
             deadline_height: s.tip + s.params.deadline_margin,
             access_blocks: offer.access_blocks,
             confirmations: s.params.confirmations,
         };
-        let invoice_bytes = codec::sign_invoice(&invoice, &s.key).expect("mock invoice encodes");
+        let invoice_bytes = codec::sign_invoice(&invoice, &s.key).map_err(MockError::Encode)?;
         s.records.push(Record {
             client,
             invoice,
@@ -419,6 +473,7 @@ impl MockIssuer {
         Ok(tip)
     }
 
+    /// The signed invoice of a purchase.
     pub fn invoice_bytes(&self, purchase_id: [u8; 16]) -> Option<Vec<u8>> {
         self.lock()
             .records
@@ -427,6 +482,7 @@ impl MockIssuer {
             .map(|r| r.invoice_bytes.clone())
     }
 
+    /// The signed grant of a purchase, once issued.
     pub fn grant_bytes(&self, purchase_id: [u8; 16]) -> Option<Vec<u8>> {
         self.lock()
             .records
@@ -443,7 +499,7 @@ impl MockIssuer {
 struct NodeState {
     node_id: [u8; 32],
     auth_header: String,
-    issuer_key: VerifyingKey,
+    issuer_key: VerificationKey,
     provider: [u8; 32],
     network: Network,
     controls: bool,
@@ -457,6 +513,7 @@ struct NodeState {
 /// A mock of the user's node: loopback JSON-RPC with cookie auth, one connection at a time.
 #[derive(Clone)]
 pub struct MockNode {
+    /// The loopback address the node listens on.
     pub addr: SocketAddr,
     state: Arc<Mutex<NodeState>>,
     issuer: MockIssuer,
@@ -477,13 +534,14 @@ impl MockNode {
                 "the mock node only binds to loopback",
             ));
         }
+        let issuer_key = codec::verification_key(issuer.public_key())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let listener = TcpListener::bind(bind)?;
         let addr = listener.local_addr()?;
         let state = Arc::new(Mutex::new(NodeState {
             node_id,
             auth_header: format!("Basic {}", STANDARD.encode(cookie.trim())),
-            issuer_key: VerifyingKey::from_bytes(&issuer.public_key())
-                .expect("mock issuer key is valid"),
+            issuer_key,
             provider: TEST_PROVIDER_NODE_ID,
             network: issuer.network(),
             controls,
@@ -511,14 +569,17 @@ impl MockNode {
         self.state.lock().expect("mock node lock")
     }
 
+    /// The issuer behind this node.
     pub fn issuer(&self) -> &MockIssuer {
         &self.issuer
     }
 
+    /// The NodeId this node claims.
     pub fn node_id(&self) -> [u8; 32] {
         self.lock().node_id
     }
 
+    /// Sets how answers are corrupted.
     pub fn set_tamper(&self, tamper: Tamper) {
         self.lock().tamper = tamper;
     }
@@ -537,14 +598,17 @@ impl MockNode {
         );
     }
 
+    /// The grant installed for a purchase.
     pub fn installed(&self, purchase_id: [u8; 16]) -> Option<Vec<u8>> {
         self.lock().installed.get(&purchase_id).cloned()
     }
 
+    /// How many grants are installed.
     pub fn installed_count(&self) -> usize {
         self.lock().installed.len()
     }
 
+    /// How many times `method` was called.
     pub fn calls(&self, method: &str) -> u64 {
         self.lock().calls.get(method).copied().unwrap_or(0)
     }
@@ -607,14 +671,11 @@ impl MockNode {
                 .ok_or((-32602, format!("missing string parameter {name}")))
         };
         let hex16 = |name: &str| -> Result<[u8; 16], (i64, String)> {
-            hexutil::decode_array::<16>(&str_param(name)?)
-                .map_err(|e| (-32602, format!("{name}: {e}")))
+            hex_array::<16>(&str_param(name)?).map_err(|e| (-32602, format!("{name}: {e}")))
         };
         let node_id = self.node_id();
         match method {
-            "getminermeshinfo" => {
-                Ok(json!({"node_id": hexutil::encode(&node_id), "simulated": true}))
-            }
+            "getminermeshinfo" => Ok(json!({"node_id": hex::encode(node_id), "simulated": true})),
             "getblockcount" => Ok(json!(self.issuer.tip())),
             "paidstream_requestinvoice" => {
                 let service = str_param("service")?;
@@ -626,13 +687,11 @@ impl MockNode {
                 if self.lock().tamper == Tamper::MalformedInvoiceAnswer {
                     // The provider recorded the request; the answer arrives garbled.
                     return Ok(
-                        json!({"purchase_id": hexutil::encode(&purchase_id), "invoice": "not hex"}),
+                        json!({"purchase_id": hex::encode(purchase_id), "invoice": "not hex"}),
                     );
                 }
                 let bytes = self.tamper_invoice(bytes);
-                Ok(
-                    json!({"purchase_id": hexutil::encode(&purchase_id), "invoice": hexutil::encode(&bytes)}),
-                )
+                Ok(json!({"purchase_id": hex::encode(purchase_id), "invoice": hex::encode(&bytes)}))
             }
             "paidstream_getgrant" => {
                 let purchase_id = hex16("purchase_id")?;
@@ -683,7 +742,7 @@ impl MockNode {
     /// Verifies the grant like a node would before using it, then records it (idempotent).
     fn set_grant(&self, grant_hex: &str) -> Result<Value, (i64, String)> {
         let invalid = |e: String| (CODE_INVALID_GRANT, format!("InvalidGrant: {e}"));
-        let bytes = hexutil::decode(grant_hex).map_err(invalid)?;
+        let bytes = hex_bytes(grant_hex).map_err(invalid)?;
         let mut s = self.lock();
         let grant =
             codec::verify_grant(&bytes, &s.issuer_key).map_err(|e| invalid(e.to_string()))?;
@@ -769,6 +828,6 @@ impl MockNode {
             }
             _ => return status.to_json(),
         };
-        json!({"status": status.name(), "grant": hexutil::encode(&forged)})
+        json!({"status": status.name(), "grant": hex::encode(&forged)})
     }
 }

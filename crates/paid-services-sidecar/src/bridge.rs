@@ -5,90 +5,90 @@
 //! trusted issuer's access authorization, not on-chain proof of payment; the bridge never
 //! derives a grant or a payment from a local txid, a user statement or the node's chain RPC.
 
-use std::fmt;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use ed25519_dalek::VerifyingKey;
+use paid_services_types::checks::{self, Expectations};
+use paid_services_types::codec::{self, Invoice, VerificationKey};
+use paid_services_types::contract;
+use paid_services_types::expiry::{self, WalletExpiryProfile};
+use paid_services_types::{hex_array, hex_bytes, uri};
 use rand_core::{OsRng, RngCore};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::checks::{self, Expectations};
-use crate::codec::{self, Invoice, Network};
-use crate::contract;
-use crate::expiry::{self, WalletExpiryProfile};
-use crate::hexutil;
 use crate::rpc::{RpcClient, RpcError};
 use crate::state::{Install, Purchase, Stage, StateError, StateFile, StateStore};
-use crate::uri;
 
+/// The sidecar configuration (see [`paid_services_types::config::SidecarConfig`]).
+pub use paid_services_types::config::SidecarConfig as Config;
+
+/// Printed by every command: what this prototype is not.
 pub const SIMULATION_NOTICE: &str = "SIMULATION ONLY: this prototype talks to a mock node and a mock issuer. \
 No wallet, no Zakura node and no payment are involved. paidstream_* are proposed RPC contracts, not existing \
 Zakura RPCs, and a mock install does not show that a node consumes a stream. Do not open a printed payment \
 request in a wallet: wallet expiry support is not solved.";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// The user's node RPC (in this prototype, the mock node). Must be loopback.
-    pub node_rpc: SocketAddr,
-    pub cookie_file: PathBuf,
-    pub state_file: PathBuf,
-    pub network: Network,
-    /// Pinned together with the issuer key.
-    pub provider_node_id: String,
-    pub issuer_public_key: String,
-    pub purchase_limit_zat: u64,
-    /// The wallet expiry profile used for the offer window (see `expiry`).
-    pub wallet_expiry_profile: String,
-    /// Blocks kept free between the expected wallet expiry and the deadline. A configured
-    /// value, not a recommendation.
-    pub offer_margin_blocks: u32,
-}
-
-impl Config {
-    /// Reads a JSON config. Relative paths are taken relative to the config file.
-    pub fn load(path: &Path) -> Result<Self, BridgeError> {
-        let err = |e: String| BridgeError::Config(format!("{}: {e}", path.display()));
-        let text = std::fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
-        let mut cfg: Config = serde_json::from_str(&text).map_err(|e| err(e.to_string()))?;
-        let base = path.parent().unwrap_or(Path::new("."));
-        if cfg.cookie_file.is_relative() {
-            cfg.cookie_file = base.join(&cfg.cookie_file);
-        }
-        if cfg.state_file.is_relative() {
-            cfg.state_file = base.join(&cfg.state_file);
-        }
-        Ok(cfg)
+/// Reads a JSON config. Relative paths are taken relative to the config file.
+pub fn load_config(path: &Path) -> Result<Config, BridgeError> {
+    let err = |e: String| BridgeError::Config(format!("{}: {e}", path.display()));
+    let text = std::fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
+    let mut cfg: Config = serde_json::from_str(&text).map_err(|e| err(e.to_string()))?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    if cfg.cookie_file.is_relative() {
+        cfg.cookie_file = base.join(&cfg.cookie_file);
     }
+    if cfg.state_file.is_relative() {
+        cfg.state_file = base.join(&cfg.state_file);
+    }
+    Ok(cfg)
 }
 
 /// Test hook: stop right after a given state write, as a crash would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrashPoint {
+    /// After the request_id is written, before the invoice request goes out.
     AfterRequested,
+    /// After the verified invoice is written.
     AfterInvoiced,
+    /// After the verified grant is written, before it is installed.
     AfterGranted,
+    /// After the installed grant is written.
     AfterInstalled,
 }
 
-#[derive(Debug)]
+/// Why a command did not complete.
+#[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
+    /// A bad command line.
+    #[error("usage: {0}")]
     Usage(String),
+    /// A bad configuration.
+    #[error("config: {0}")]
     Config(String),
-    State(StateError),
+    /// The state file is locked or unreadable.
+    #[error(transparent)]
+    State(#[from] StateError),
     /// No answer from the node: the outcome is unknown, and `resume` retries the same request.
+    #[error("{0}")]
     NodeUnreachable(String),
+    /// The node answered with an error or something unexpected.
+    #[error("{0}")]
     Node(String),
     /// The invoice request did not complete. The purchase and its request_id are kept.
+    #[error("not completed: {0}")]
     Retryable(String),
+    /// The provider refused the purchase, or an object failed a check.
+    #[error("rejected: {0}")]
     Rejected(String),
+    /// No purchase matches.
+    #[error("not found: {0}")]
     NotFound(String),
+    /// The test hook stopped the command.
+    #[error("simulated crash after {0:?}")]
     SimulatedCrash(CrashPoint),
 }
 
 impl BridgeError {
+    /// The process exit code for this error.
     pub fn exit_code(&self) -> i32 {
         match self {
             BridgeError::Usage(_) | BridgeError::Config(_) => 2,
@@ -102,30 +102,6 @@ impl BridgeError {
     }
 }
 
-impl fmt::Display for BridgeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BridgeError::Usage(e) => write!(f, "usage: {e}"),
-            BridgeError::Config(e) => write!(f, "config: {e}"),
-            BridgeError::State(e) => write!(f, "{e}"),
-            BridgeError::NodeUnreachable(e) => write!(f, "{e}"),
-            BridgeError::Node(e) => write!(f, "{e}"),
-            BridgeError::Retryable(e) => write!(f, "not completed: {e}"),
-            BridgeError::Rejected(e) => write!(f, "rejected: {e}"),
-            BridgeError::NotFound(e) => write!(f, "not found: {e}"),
-            BridgeError::SimulatedCrash(p) => write!(f, "simulated crash after {p:?}"),
-        }
-    }
-}
-
-impl std::error::Error for BridgeError {}
-
-impl From<StateError> for BridgeError {
-    fn from(e: StateError) -> Self {
-        BridgeError::State(e)
-    }
-}
-
 fn node_error(method: &str, e: RpcError) -> BridgeError {
     match e {
         RpcError::Transport(t) => BridgeError::NodeUnreachable(format!(
@@ -135,29 +111,44 @@ fn node_error(method: &str, e: RpcError) -> BridgeError {
     }
 }
 
+/// Whether a payment request is shown, and why not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaymentRequest {
+    /// The request is shown.
     Offered {
+        /// The ZIP 321 URI.
         uri: String,
+        /// Price in zatoshis.
         amount_zat: u64,
+        /// The invoice deadline height.
         deadline_height: u32,
         /// The `nExpiryHeight` a wallet following the configured profile would set now.
         expected_expiry: u32,
         /// Shown again for an invoice that was already shown once.
         reshown: bool,
     },
+    /// The request is withheld, with the reason.
     Withheld(String),
 }
 
+/// What a command reports about one purchase.
 #[derive(Clone, Debug)]
 pub struct PurchaseView {
+    /// The request_id (hex).
     pub request_id: String,
+    /// The provider's purchase id (hex), once known.
     pub purchase_id: Option<String>,
+    /// The service.
     pub service: String,
+    /// Where the purchase stands.
     pub stage: Stage,
+    /// The provider's last reported status.
     pub last_status: Option<String>,
+    /// The payment request, when a command decided on one.
     pub payment: Option<PaymentRequest>,
+    /// The installed grant's heights.
     pub install: Option<Install>,
+    /// A note about the last step.
     pub note: Option<String>,
 }
 
@@ -168,10 +159,12 @@ pub fn random_bytes<const N: usize>() -> Result<[u8; N], rand_core::Error> {
     Ok(out)
 }
 
+/// An open sidecar: configuration, node client and locked state.
 pub struct Bridge {
     cfg: Config,
     rpc: RpcClient,
-    issuer_key: VerifyingKey,
+    issuer_key: VerificationKey,
+    issuer_key_bytes: [u8; 32],
     provider: [u8; 32],
     store: StateStore,
     state: StateFile,
@@ -183,11 +176,11 @@ pub struct Bridge {
 impl Bridge {
     /// Takes the state lock and loads the state. A second process on the same state file fails here.
     pub fn open(cfg: Config) -> Result<Self, BridgeError> {
-        let key_bytes: [u8; 32] = hexutil::decode_array(&cfg.issuer_public_key)
+        let key_bytes: [u8; 32] = hex_array(&cfg.issuer_public_key)
             .map_err(|e| BridgeError::Config(format!("issuer_public_key: {e}")))?;
-        let issuer_key = VerifyingKey::from_bytes(&key_bytes)
+        let issuer_key = codec::verification_key(key_bytes)
             .map_err(|_| BridgeError::Config("issuer_public_key is not an Ed25519 key".into()))?;
-        let provider = hexutil::decode_array(&cfg.provider_node_id)
+        let provider = hex_array(&cfg.provider_node_id)
             .map_err(|e| BridgeError::Config(format!("provider_node_id: {e}")))?;
         let rpc = RpcClient::from_cookie_file(cfg.node_rpc, &cfg.cookie_file)
             .map_err(BridgeError::Config)?;
@@ -207,6 +200,7 @@ impl Bridge {
             cfg,
             rpc,
             issuer_key,
+            issuer_key_bytes: key_bytes,
             provider,
             store,
             state,
@@ -216,14 +210,17 @@ impl Bridge {
         })
     }
 
+    /// Test hook: stop after the given state write.
     pub fn set_crash_point(&mut self, point: Option<CrashPoint>) {
         self.crash = point;
     }
 
+    /// The loaded state.
     pub fn state(&self) -> &StateFile {
         &self.state
     }
 
+    /// A view of every purchase in the state.
     pub fn views(&self) -> Vec<PurchaseView> {
         (0..self.state.purchases.len())
             .map(|i| self.view(i, None))
@@ -280,7 +277,7 @@ impl Bridge {
                 "the node reports no v2 node ID (getminermeshinfo.node_id is null)".into(),
             )
         })?;
-        let id = hexutil::decode_array(hex)
+        let id = hex_array(hex)
             .map_err(|e| BridgeError::Node(format!("getminermeshinfo.node_id: {e}")))?;
         self.node_id = Some(id);
         Ok(id)
@@ -289,7 +286,7 @@ impl Bridge {
     fn expectations(&mut self) -> Result<Expectations, BridgeError> {
         Ok(Expectations {
             network: self.cfg.network,
-            issuer_key: self.issuer_key.to_bytes(),
+            issuer_key: self.issuer_key_bytes,
             provider_node_id: self.provider,
             client_node_id: self.node_id()?,
         })
@@ -332,7 +329,7 @@ impl Bridge {
             .invoice
             .as_deref()
             .ok_or_else(|| BridgeError::Rejected("purchase has no stored invoice".into()))?;
-        let bytes = hexutil::decode(hex).map_err(BridgeError::Rejected)?;
+        let bytes = hex_bytes(hex).map_err(BridgeError::Rejected)?;
         codec::verify_invoice(&bytes, &self.issuer_key)
             .map_err(|e| BridgeError::Rejected(format!("stored invoice no longer verifies: {e}")))
     }
@@ -372,7 +369,7 @@ impl Bridge {
         let request_id = random_bytes::<16>()
             .map_err(|e| BridgeError::Config(format!("the OS random generator failed: {e}")))?;
         self.state.purchases.push(Purchase {
-            request_id: hexutil::encode(&request_id),
+            request_id: hex::encode(request_id),
             service: service.to_string(),
             stage: Stage::Requested,
             purchase_id: None,
@@ -435,10 +432,10 @@ impl Bridge {
                 .ok_or_else(|| format!("answer has no {name}"))
         };
         let parsed = field("purchase_id")
-            .and_then(|pid| hexutil::decode_array::<16>(&pid))
+            .and_then(|pid| hex_array::<16>(&pid))
             .and_then(|pid| {
                 field("invoice")
-                    .and_then(|inv| hexutil::decode(&inv))
+                    .and_then(|inv| hex_bytes(&inv))
                     .map(|inv| (pid, inv))
             });
         let (purchase_id, invoice_bytes) = match parsed {
@@ -469,8 +466,8 @@ impl Bridge {
         }
         {
             let p = &mut self.state.purchases[idx];
-            p.purchase_id = Some(hexutil::encode(&purchase_id));
-            p.invoice = Some(hexutil::encode(&invoice_bytes));
+            p.purchase_id = Some(hex::encode(purchase_id));
+            p.invoice = Some(hex::encode(&invoice_bytes));
             p.stage = Stage::Invoiced;
             p.note = None;
         }
@@ -611,7 +608,7 @@ impl Bridge {
     fn poll_grant(&mut self, idx: usize) -> Result<PurchaseView, BridgeError> {
         let inv = self.stored_invoice(idx)?;
         let exp = self.expectations()?;
-        let pid = hexutil::encode(&inv.purchase_id);
+        let pid = hex::encode(inv.purchase_id);
         let answer = self
             .rpc
             .call("paidstream_getgrant", json!({"purchase_id": pid}))
@@ -682,10 +679,10 @@ impl Bridge {
         inv: &Invoice,
         exp: &Expectations,
     ) -> Result<(), String> {
-        let bytes = hexutil::decode(grant_hex)?;
+        let bytes = hex_bytes(grant_hex)?;
         let grant = codec::verify_grant(&bytes, &self.issuer_key).map_err(|e| e.to_string())?;
         checks::check_grant(&grant, inv, exp).map_err(|e| e.to_string())?;
-        let encoded = hexutil::encode(&bytes);
+        let encoded = hex::encode(&bytes);
         let p = &mut self.state.purchases[idx];
         if let Some(existing) = &p.grant {
             if existing != &encoded {
@@ -704,7 +701,7 @@ impl Bridge {
             .grant
             .clone()
             .ok_or_else(|| BridgeError::Rejected("purchase has no stored grant".into()))?;
-        let bytes = hexutil::decode(&grant_hex).map_err(BridgeError::Rejected)?;
+        let bytes = hex_bytes(&grant_hex).map_err(BridgeError::Rejected)?;
         let grant = codec::verify_grant(&bytes, &self.issuer_key)
             .map_err(|e| BridgeError::Rejected(format!("stored grant no longer verifies: {e}")))?;
         match self

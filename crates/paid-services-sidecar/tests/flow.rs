@@ -4,29 +4,27 @@
 //! under `CARGO_TARGET_TMPDIR`, each in a new directory, and never delete anything.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::VerifyingKey;
 use serde_json::json;
 
-use paid_stream_bridge::bridge::{
-    Bridge, BridgeError, Config, CrashPoint, PaymentRequest, PurchaseView,
-};
-use paid_stream_bridge::codec::{self, Invoice, Network};
-use paid_stream_bridge::contract;
-use paid_stream_bridge::expiry::LIBRUSTZCASH_DEFAULT;
-use paid_stream_bridge::hexutil;
-use paid_stream_bridge::mock::{
-    self, MockError, MockIssuer, MockNode, MockParams, Tamper, OTHER_CLIENT_NODE_ID,
+use paid_services_mock::{
+    self as mock, MockError, MockIssuer, MockNode, MockParams, Tamper, OTHER_CLIENT_NODE_ID,
     TEST_CLIENT_NODE_ID, TEST_PROVIDER_NODE_ID,
 };
-use paid_stream_bridge::rpc::{RpcClient, RpcError};
-use paid_stream_bridge::state::{Stage, StateError};
-use paid_stream_bridge::uri;
+use paid_services_sidecar::bridge::{
+    Bridge, BridgeError, Config, CrashPoint, PaymentRequest, PurchaseView,
+};
+use paid_services_sidecar::rpc::{RpcClient, RpcError};
+use paid_services_sidecar::state::{Stage, StateError};
+use paid_services_types::codec::{self, Invoice, Network};
+use paid_services_types::contract;
+use paid_services_types::expiry::LIBRUSTZCASH_DEFAULT;
+use paid_services_types::{hex_array, uri};
 
-const BIN: &str = env!("CARGO_BIN_EXE_paid-stream-bridge");
+const BIN: &str = env!("CARGO_BIN_EXE_paid-services-sidecar");
 const COOKIE: &str = "__cookie__:flow-test-cookie";
 const SERVICE: &str = "synthetic-10";
 const OFFER_MARGIN: u32 = 10;
@@ -71,8 +69,8 @@ fn env_with(name: &str, limit_zat: u64) -> Env {
         cookie_file,
         state_file: dir.join("state.json"),
         network: Network::Test,
-        provider_node_id: hexutil::encode(&TEST_PROVIDER_NODE_ID),
-        issuer_public_key: hexutil::encode(&issuer.public_key()),
+        provider_node_id: hex::encode(TEST_PROVIDER_NODE_ID),
+        issuer_public_key: hex::encode(issuer.public_key()),
         purchase_limit_zat: limit_zat,
         wallet_expiry_profile: "librustzcash-default".into(),
         offer_margin_blocks: OFFER_MARGIN, // test data
@@ -108,11 +106,11 @@ fn withheld(v: &PurchaseView) -> String {
 }
 
 fn pid_of(v: &PurchaseView) -> [u8; 16] {
-    hexutil::decode_array(v.purchase_id.as_deref().expect("purchase_id")).unwrap()
+    hex_array(v.purchase_id.as_deref().expect("purchase_id")).unwrap()
 }
 
 fn invoice_of(env: &Env, pid: [u8; 16]) -> Invoice {
-    let key = VerifyingKey::from_bytes(&env.issuer.public_key()).unwrap();
+    let key = codec::verification_key(env.issuer.public_key()).unwrap();
     codec::verify_invoice(&env.issuer.invoice_bytes(pid).unwrap(), &key).unwrap()
 }
 
@@ -182,9 +180,9 @@ fn signed_invoice_to_uri_pending_issued_verified_grant_mock_install() {
     assert_eq!(env.node.installed(pid).unwrap(), grant_bytes);
     assert_eq!(
         b.state().purchases[0].grant.as_deref().unwrap(),
-        hexutil::encode(&grant_bytes)
+        hex::encode(&grant_bytes)
     );
-    let key = VerifyingKey::from_bytes(&env.issuer.public_key()).unwrap();
+    let key = codec::verification_key(env.issuer.public_key()).unwrap();
     let grant = codec::verify_grant(&grant_bytes, &key).unwrap();
     let install = v.install.unwrap();
     assert_eq!(
@@ -219,7 +217,7 @@ fn lost_requestinvoice_answer_is_retried_with_the_same_request_id() {
     let pid = pid_of(&v);
     assert_eq!(
         b.state().purchases[0].invoice.as_deref().unwrap(),
-        hexutil::encode(&env.issuer.invoice_bytes(pid).unwrap())
+        hex::encode(env.issuer.invoice_bytes(pid).unwrap())
     );
     let (first, _) = offered(&v);
 
@@ -371,7 +369,7 @@ fn same_request_id_repeats_and_conflicting_terms() {
     let state = json!({
         "format": 1,
         "purchases": [{
-            "request_id": hexutil::encode(&request_id),
+            "request_id": hex::encode(request_id),
             "service": "synthetic-20",
             "stage": "requested"
         }]
@@ -382,7 +380,7 @@ fn same_request_id_repeats_and_conflicting_terms() {
     assert_eq!(v.stage, Stage::Rejected);
     assert!(v.note.unwrap().contains("RequestConflict"));
     assert!(v.payment.is_none());
-    let shown = b.show(&hexutil::encode(&request_id)).unwrap();
+    let shown = b.show(&hex::encode(request_id)).unwrap();
     assert!(withheld(&shown).contains("failed a check"));
 }
 
@@ -446,10 +444,7 @@ fn mock_contract_setgrant_refuses_a_grant_for_another_node() {
     let other = spawn_node(&env.issuer, OTHER_CLIENT_NODE_ID, false);
     let client = RpcClient::new(other.addr, COOKIE).unwrap();
     let err = client
-        .call(
-            "paidstream_setgrant",
-            json!({"grant": hexutil::encode(&grant)}),
-        )
+        .call("paidstream_setgrant", json!({"grant": hex::encode(&grant)}))
         .unwrap_err();
     assert!(
         matches!(&err, RpcError::Rpc { code, .. } if *code == mock::CODE_INVALID_GRANT),
@@ -472,14 +467,14 @@ fn mock_contract_getgrant_from_another_nodeid_is_not_found() {
     let answer = client
         .call(
             "paidstream_getgrant",
-            json!({"purchase_id": hexutil::encode(&pid)}),
+            json!({"purchase_id": hex::encode(pid)}),
         )
         .unwrap();
     assert_eq!(answer, json!({"status": "NotFound"}));
     let unknown = client
         .call(
             "paidstream_getgrant",
-            json!({"purchase_id": hexutil::encode(&[9u8; 16])}),
+            json!({"purchase_id": hex::encode([9u8; 16])}),
         )
         .unwrap();
     assert_eq!(
@@ -791,7 +786,7 @@ fn transient_error_after_the_provider_recorded_the_request_returns_the_same_invo
     let pid = pid_of(&v);
     assert_eq!(
         b.state().purchases[0].invoice.as_deref().unwrap(),
-        hexutil::encode(&env.issuer.invoice_bytes(pid).unwrap())
+        hex::encode(env.issuer.invoice_bytes(pid).unwrap())
     );
 }
 
@@ -864,36 +859,12 @@ fn unrecognized_or_nonfinal_error_codes_keep_the_request() {
     }
 }
 
-fn wait_for(path: &Path) {
-    let start = Instant::now();
-    while !path.exists() {
-        assert!(
-            start.elapsed() < Duration::from_secs(20),
-            "{} never appeared",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    std::thread::sleep(Duration::from_millis(100));
-}
-
+/// The sidecar binary end to end against an in-process mock node. The mock's own binary has
+/// a smoke test in the mock crate.
 #[test]
-fn cli_demo_end_to_end_against_the_mock_node() {
-    let dir = fresh_dir("cli-demo").join("demo");
-    let mut child = Command::new(BIN)
-        .args([
-            "mock-node",
-            "--dir",
-            dir.to_str().unwrap(),
-            "--serve-secs",
-            "60",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let cfg_path = dir.join("bridge.json");
-    wait_for(&cfg_path);
+fn cli_end_to_end_against_the_mock_node() {
+    let env = env("cli-demo");
+    let cfg_path = write_config(&env);
     let cfg = cfg_path.to_str().unwrap();
 
     let out = cli(&["--config", cfg, "buy", SERVICE]);
@@ -909,18 +880,7 @@ fn cli_demo_end_to_end_against_the_mock_node() {
         .unwrap()
         .to_string();
 
-    for args in [
-        vec!["mock-control", "--config", cfg, "pay", pid.as_str()],
-        vec!["mock-control", "--config", cfg, "mine", "2"],
-    ] {
-        let out = cli(&args);
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "{args:?}: {}",
-            text(&out.stderr)
-        );
-    }
+    pay_and_confirm(&env, hex_array(&pid).unwrap());
     let out = cli(&["--config", cfg, "status"]);
     let stdout = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -929,7 +889,4 @@ fn cli_demo_end_to_end_against_the_mock_node() {
 
     let out = cli(&["--config", cfg, "show", &pid]);
     assert!(text(&out.stdout).contains("already issued"));
-
-    child.kill().unwrap();
-    child.wait().unwrap();
 }

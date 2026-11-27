@@ -1,70 +1,71 @@
 //! What the bridge checks before it shows a payment request or installs a grant.
 
-use std::fmt;
-
 use crate::codec::{Grant, Invoice, Network};
 use crate::uri;
 
 /// Values the bridge trusts: its own configuration and the node's own NodeId.
 #[derive(Clone, Debug)]
 pub struct Expectations {
+    /// The configured network.
     pub network: Network,
+    /// The pinned issuer key.
     pub issuer_key: [u8; 32],
+    /// The pinned provider NodeId.
     pub provider_node_id: [u8; 32],
+    /// The node's own NodeId.
     pub client_node_id: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why an invoice or grant failed a check.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CheckError {
+    /// The object names another network.
+    #[error("object is for another network")]
     Network,
+    /// The object names another issuer key.
+    #[error("object names another issuer key")]
     IssuerKey,
+    /// The object names another provider.
+    #[error("object names another provider NodeId")]
     Provider,
+    /// The object is bound to another client.
+    #[error("object is bound to another client NodeId than this node's")]
     Client,
-    Service { expected: String, got: String },
+    /// The object is for another service.
+    #[error("object is for service {got:?}, expected {expected:?}")]
+    Service {
+        /// The service asked for.
+        expected: String,
+        /// The service in the object.
+        got: String,
+    },
+    /// The purchase id differs from the answer's.
+    #[error("purchase_id differs from the signed invoice")]
     PurchaseId,
+    /// The invoice costs nothing.
+    #[error("invoice amount is zero")]
     AmountZero,
-    OverLimit { amount_zat: u64, limit_zat: u64 },
+    /// The invoice costs more than the purchase limit.
+    #[error("invoice amount {amount_zat} zat is above the purchase limit {limit_zat} zat")]
+    OverLimit {
+        /// The invoice amount.
+        amount_zat: u64,
+        /// The configured limit.
+        limit_zat: u64,
+    },
+    /// The terms are invalid.
+    #[error("invoice terms are invalid: {0}")]
     Terms(&'static str),
+    /// The destination is invalid.
+    #[error("invoice destination is invalid: {0}")]
     Destination(String),
+    /// The payment request built from the invoice does not read back.
+    #[error("payment request check failed: {0}")]
     PaymentRequest(String),
+    /// The grant does not match its invoice.
+    #[error("grant does not match the invoice: {0}")]
     GrantMismatch(&'static str),
 }
-
-impl fmt::Display for CheckError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CheckError::Network => write!(f, "object is for another network"),
-            CheckError::IssuerKey => write!(f, "object names another issuer key"),
-            CheckError::Provider => write!(f, "object names another provider NodeId"),
-            CheckError::Client => {
-                write!(
-                    f,
-                    "object is bound to another client NodeId than this node's"
-                )
-            }
-            CheckError::Service { expected, got } => {
-                write!(f, "object is for service {got:?}, expected {expected:?}")
-            }
-            CheckError::PurchaseId => write!(f, "purchase_id differs from the signed invoice"),
-            CheckError::AmountZero => write!(f, "invoice amount is zero"),
-            CheckError::OverLimit {
-                amount_zat,
-                limit_zat,
-            } => write!(
-                f,
-                "invoice amount {amount_zat} zat is above the purchase limit {limit_zat} zat"
-            ),
-            CheckError::Terms(what) => write!(f, "invoice terms are invalid: {what}"),
-            CheckError::Destination(e) => write!(f, "invoice destination is invalid: {e}"),
-            CheckError::PaymentRequest(e) => write!(f, "payment request check failed: {e}"),
-            CheckError::GrantMismatch(what) => {
-                write!(f, "grant does not match the invoice: {what}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CheckError {}
 
 fn check_parties(
     network: Network,
