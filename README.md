@@ -77,10 +77,32 @@ paid-stream-bridge --config /tmp/psb-demo-1/bridge.json status
 - It then reads the request back with the `zip321` reference parser and compares address, network, amount and memo with the invoice. This checks the bridge's own output only; it is not evidence that any wallet accepts the request.
 
 **When a request is offered:** only while both hold:
-- the provider still reports the purchase as `Pending`;
-- the local node's height is below the deadline.
+- the provider still reports the purchase as `Pending`, which means it has seen no payment;
+- the offer window is open: `tip + 1 + expiry_delta + offer_margin_blocks <= deadline`.
 
-Otherwise it is withheld. Using the local height only to withhold is conservative; it is never used to grant.
+`expiry_delta` comes from an explicit wallet expiry profile (`wallet_expiry_profile` in the config, see `src/expiry.rs`). The only profile, `librustzcash-default`, was read from the source of zecd 0.10.0, Vizor v0.0.66 and Zodl's librustzcash:
+- the target height plus 40 blocks before NU7;
+- plus 120 blocks from NU7.
+
+It was not tested against a running wallet. `offer_margin_blocks` is a configured value, not a recommendation.
+
+The window is a heuristic. It limits when a request is shown, but it cannot stop a user from paying later, so a late payment can still miss the deadline rule. A test shows exactly that.
+
+Otherwise the request is withheld. The local height is only ever used to withhold, never to grant.
+
+**Statuses** of `paidstream_getgrant`:
+
+| Status | Meaning |
+|---|---|
+| `Pending` | No payment seen. |
+| `PaymentSeen` | A payment still short of its confirmations. |
+| `Underpaid` | A payment below the invoice amount. |
+| `NeedsReconciliation` | A payment that breaks the deadline rule. |
+| `Issued` | A grant was issued. |
+| `Expired` | The purchase or its grant expired. |
+| `NotFound` | Unknown, or bound to another client. |
+
+`PaymentSeen` and every status other than `Pending` withhold the request.
 
 **Grant** (signed in the grant domain): checked like the invoice, plus the service, the `purchase_id`, and that the duration equals the quoted access. A second, different grant for the same purchase is refused, and the first is kept.
 
@@ -104,10 +126,14 @@ These are prototype values, defined in `src/contract.rs` and shared by the bridg
 
 Only code 3 ends a purchase. Every other error answer leaves the purchase in `requested` with its request_id, and so does a missing answer. That covers codes the bridge does not recognise and standard JSON-RPC codes. `resume`, or the next `buy` for the same service, retries the same request. A new request_id is never created for it.
 
+A malformed answer is kept for retry the same way: a missing field or bad hex. The provider may already hold an invoice for that request_id. An invoice that fails its signature or a check is rejected.
+
+Zakura answers handler errors with HTTP 200 (`zakura-rpc/src/server/http.rs:180` at Zakura `cb148173`), so a code 3 rejection reaches the bridge in a 200 answer. Other HTTP statuses are transport-level problems, and the bridge keeps the purchase on them.
+
 ### Known limits and open integration points
 
-- **The deadline rule cannot be guaranteed before payment by a user's own wallet.** ZIP 321 has no expiry field. ZIP 316 Revision 2 address expiry is an option whose wallet support still has to be verified. It is not implemented here.
-- **`Pending` does not mean "not paid".** The proposed `GetGrant` status `Pending` also covers a payment still short of its confirmations. Showing the QR code or link again cannot prevent a second payment: `show` only warns. A separate status would be a protocol change.
+- **The deadline rule cannot be guaranteed before payment by a user's own wallet.** ZIP 321 has no expiry field. The offer window only narrows when a request is shown. ZIP 316 Revision 2 address expiry is an option whose wallet support still has to be verified. It is not implemented here. What happens to money that misses the rule is still undecided.
+- **`Pending` does not mean "not paid".** It means the provider has seen no payment yet. A payment that was just broadcast may not have been seen. Showing the QR code or link again cannot prevent a second payment: `show` only warns.
 - **A mock grant install is not stream consumption.** `paidstream_setgrant` on the mock node only records the grant. No node receives or consumes a paid stream.
 - **No wallet result reaches the bridge.** QR and deep-link wallets return nothing to the caller, so the bridge cannot detect a lost wallet answer.
 - **The real node side does not exist yet:** the three RPCs, the paid-stream P2P service, grant persistence in the node, and capability allocation.

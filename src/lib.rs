@@ -8,6 +8,7 @@ pub mod bridge;
 pub mod checks;
 pub mod codec;
 pub mod contract;
+pub mod expiry;
 pub mod hexutil;
 pub mod mock;
 pub mod rpc;

@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use paid_stream_bridge::bridge::{
     random_bytes, Bridge, BridgeError, Config, PaymentRequest, PurchaseView, SIMULATION_NOTICE,
 };
+use paid_stream_bridge::expiry::LIBRUSTZCASH_DEFAULT;
 use paid_stream_bridge::hexutil;
 use paid_stream_bridge::mock::{
     MockIssuer, MockNode, MockParams, TEST_CLIENT_NODE_ID, TEST_PROVIDER_NODE_ID,
@@ -132,6 +133,7 @@ fn print_view(v: &PurchaseView) {
             uri,
             amount_zat,
             deadline_height,
+            expected_expiry,
             reshown,
         }) => {
             println!("  payment request (simulation; do not open in a wallet, do not pay):");
@@ -140,10 +142,14 @@ fn print_view(v: &PurchaseView) {
                 "    amount {} ZEC, deadline height {deadline_height} (test data)",
                 format_zec(*amount_zat)
             );
+            println!(
+                "    a wallet paying now would set nExpiryHeight about {expected_expiry} (expiry profile; \
+a heuristic, not a guarantee: paying later can miss the deadline rule)"
+            );
             if *reshown {
                 println!(
-                    "    shown again: if you already paid this request, do not pay again. A payment still short \
-of its confirmations is also reported as Pending, and a second payment only goes to reconciliation."
+                    "    shown again: if you already paid this request, do not pay again. A payment the provider \
+has not seen yet is still reported as Pending, and a second payment only goes to reconciliation."
                 );
             }
         }
@@ -222,6 +228,8 @@ fn start_mock_node(dir: &Path, port: u16) -> Result<(MockNode, PathBuf), String>
         provider_node_id: hexutil::encode(&TEST_PROVIDER_NODE_ID),
         issuer_public_key: hexutil::encode(&issuer.public_key()),
         purchase_limit_zat: 100_000,
+        wallet_expiry_profile: LIBRUSTZCASH_DEFAULT.name.to_string(),
+        offer_margin_blocks: 10,
     };
     let cfg_path = dir.join("bridge.json");
     let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())? + "\n";

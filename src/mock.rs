@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use zcash_address::unified::{self, Encoding as _};
 
 use crate::codec::{self, Grant, Invoice, Network, GRANT_DOMAIN, INVOICE_DOMAIN, SIGNATURE_LEN};
+use crate::expiry::LIBRUSTZCASH_DEFAULT;
 use crate::hexutil;
 use crate::rpc::{read_http_message, write_http_response};
 
@@ -90,6 +91,7 @@ pub enum Tamper {
     GrantInvoiceDomain,
     GrantOtherClient,
     IssuedWithoutGrant,
+    MalformedInvoiceAnswer,
 }
 
 impl Tamper {
@@ -105,6 +107,7 @@ impl Tamper {
         ("grant-invoice-domain", Tamper::GrantInvoiceDomain),
         ("grant-other-client", Tamper::GrantOtherClient),
         ("issued-without-grant", Tamper::IssuedWithoutGrant),
+        ("malformed-invoice-answer", Tamper::MalformedInvoiceAnswer),
     ];
 
     pub fn parse(s: &str) -> Option<Tamper> {
@@ -145,6 +148,7 @@ impl MockError {
 pub enum MockStatus {
     NotFound,
     Pending,
+    PaymentSeen,
     Underpaid,
     NeedsReconciliation,
     Issued(Vec<u8>),
@@ -156,6 +160,7 @@ impl MockStatus {
         match self {
             MockStatus::NotFound => "NotFound",
             MockStatus::Pending => "Pending",
+            MockStatus::PaymentSeen => "PaymentSeen",
             MockStatus::Underpaid => "Underpaid",
             MockStatus::NeedsReconciliation => "NeedsReconciliation",
             MockStatus::Issued(_) => "Issued",
@@ -244,7 +249,8 @@ impl IssuerState {
             None => MockStatus::Pending,
             Some(p) if !qualifies(p, &r.invoice) => MockStatus::NeedsReconciliation,
             Some(p) if p.amount_zat < r.invoice.amount_zat => MockStatus::Underpaid,
-            Some(_) => MockStatus::Pending,
+            // A qualifying payment still short of its confirmations.
+            Some(_) => MockStatus::PaymentSeen,
         }
     }
 }
@@ -382,6 +388,8 @@ impl MockIssuer {
     }
 
     /// Records a payment included in the next block (which this mines). Test control only.
+    /// Without an explicit expiry, the payment carries the expiry a wallet following the
+    /// librustzcash default profile sets when it sends at the current tip.
     pub fn pay(
         &self,
         purchase_id: [u8; 16],
@@ -389,6 +397,9 @@ impl MockIssuer {
         expiry_height: Option<u32>,
     ) -> Result<u32, MockError> {
         let mut s = self.lock();
+        let wallet_expiry = LIBRUSTZCASH_DEFAULT
+            .expiry_for_tip(s.params.network, s.tip)
+            .unwrap_or(0);
         s.tip += 1;
         let tip = s.tip;
         let r = s
@@ -402,7 +413,7 @@ impl MockIssuer {
         r.payment = Some(Payment {
             amount_zat: amount_zat.unwrap_or(r.invoice.amount_zat),
             included_height: tip,
-            expiry_height: expiry_height.unwrap_or(r.invoice.deadline_height),
+            expiry_height: expiry_height.unwrap_or(wallet_expiry),
         });
         s.issue_due();
         Ok(tip)
@@ -612,6 +623,12 @@ impl MockNode {
                     .issuer
                     .request_invoice(node_id, &service, request_id)
                     .map_err(|e| (e.code(), e.message()))?;
+                if self.lock().tamper == Tamper::MalformedInvoiceAnswer {
+                    // The provider recorded the request; the answer arrives garbled.
+                    return Ok(
+                        json!({"purchase_id": hexutil::encode(&purchase_id), "invoice": "not hex"}),
+                    );
+                }
                 let bytes = self.tamper_invoice(bytes);
                 Ok(
                     json!({"purchase_id": hexutil::encode(&purchase_id), "invoice": hexutil::encode(&bytes)}),

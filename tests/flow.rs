@@ -16,6 +16,7 @@ use paid_stream_bridge::bridge::{
 };
 use paid_stream_bridge::codec::{self, Invoice, Network};
 use paid_stream_bridge::contract;
+use paid_stream_bridge::expiry::LIBRUSTZCASH_DEFAULT;
 use paid_stream_bridge::hexutil;
 use paid_stream_bridge::mock::{
     self, MockError, MockIssuer, MockNode, MockParams, Tamper, OTHER_CLIENT_NODE_ID,
@@ -28,6 +29,7 @@ use paid_stream_bridge::uri;
 const BIN: &str = env!("CARGO_BIN_EXE_paid-stream-bridge");
 const COOKIE: &str = "__cookie__:flow-test-cookie";
 const SERVICE: &str = "synthetic-10";
+const OFFER_MARGIN: u32 = 10;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -72,6 +74,8 @@ fn env_with(name: &str, limit_zat: u64) -> Env {
         provider_node_id: hexutil::encode(&TEST_PROVIDER_NODE_ID),
         issuer_public_key: hexutil::encode(&issuer.public_key()),
         purchase_limit_zat: limit_zat,
+        wallet_expiry_profile: "librustzcash-default".into(),
+        offer_margin_blocks: OFFER_MARGIN, // test data
     };
     Env {
         issuer,
@@ -158,12 +162,17 @@ fn signed_invoice_to_uri_pending_issued_verified_grant_mock_install() {
     assert_eq!(v.last_status.as_deref(), Some("Pending"));
     assert_eq!(v.stage, Stage::Invoiced);
 
+    // The mock pays with the expiry the wallet profile sets at send time, not the deadline.
     env.issuer.pay(pid, None, None).unwrap();
     env.issuer.mine(1); // 2 of 3 confirmations
     let v = b.status(None).unwrap().remove(0);
-    assert_eq!(v.last_status.as_deref(), Some("Pending"));
+    assert_eq!(v.last_status.as_deref(), Some("PaymentSeen"));
     assert_eq!(v.stage, Stage::Invoiced);
     assert_eq!(env.node.installed_count(), 0);
+    // A seen payment withholds the request, for `show` and for a repeated `buy`.
+    let shown = b.show(v.purchase_id.as_deref().unwrap()).unwrap();
+    assert!(withheld(&shown).contains("seen a payment"));
+    assert!(withheld(&b.buy(SERVICE).unwrap()).contains("seen a payment"));
 
     env.issuer.mine(1); // 3 of 3
     let v = b.status(None).unwrap().remove(0);
@@ -548,8 +557,10 @@ fn a_second_process_on_the_same_state_is_locked_out() {
     assert_eq!(env.issuer.invoices_created(), 0);
 
     drop(held);
-    // Lock reacquisition failed intermittently during parallel test runs.
-    // Retry only Locked within a fixed bound; other errors fail immediately.
+    // Lock reacquisition failed intermittently during parallel test runs. Hypothesis, not
+    // verified: another test spawning a process can briefly share the lock file's open file
+    // description before exec closes it. A bridge that spawns child processes could see the
+    // same. Retry only Locked within a fixed bound; other errors fail immediately.
     let start = Instant::now();
     loop {
         match Bridge::open(env.cfg.clone()) {
@@ -573,10 +584,10 @@ fn expired_invoice_is_not_offered_again() {
     let pid = pid_of(&v);
     let inv = invoice_of(&env, pid);
 
-    // The tip reaches the deadline: the local height check withholds the request.
+    // The tip reaches the deadline: the offer window closed long before.
     env.issuer.mine(inv.deadline_height - env.issuer.tip());
     let shown = b.show(v.purchase_id.as_deref().unwrap()).unwrap();
-    assert!(withheld(&shown).contains("reached the deadline height"));
+    assert!(withheld(&shown).contains("offer window closed"));
 
     // One block later the provider reports Expired.
     env.issuer.mine(1);
@@ -664,6 +675,67 @@ fn destinations_and_rpc_endpoints_are_checked() {
         matches!(&err, RpcError::Protocol(m) if m.contains("401")),
         "{err}"
     );
+}
+
+#[test]
+fn the_offer_window_closes_early_but_does_not_stop_a_late_payment() {
+    let env = env("offer-window");
+    let mut b = open(&env);
+    let v = b.buy(SERVICE).unwrap();
+    let pid = pid_of(&v);
+    let inv = invoice_of(&env, pid);
+    let profile = LIBRUSTZCASH_DEFAULT;
+    let expiry_at = |tip: u32| profile.expiry_for_tip(Network::Test, tip).unwrap();
+    match &v.payment {
+        Some(PaymentRequest::Offered {
+            expected_expiry, ..
+        }) => assert_eq!(*expected_expiry, expiry_at(env.issuer.tip())),
+        other => panic!("expected a payment request, got {other:?}"),
+    }
+
+    // The window closes at the first tip where the expected expiry plus the margin passes
+    // the deadline, before the deadline itself.
+    while expiry_at(env.issuer.tip()) + OFFER_MARGIN <= inv.deadline_height {
+        env.issuer.mine(1);
+    }
+    assert!(env.issuer.tip() < inv.deadline_height);
+    let shown = b.show(v.purchase_id.as_deref().unwrap()).unwrap();
+    assert!(withheld(&shown).contains("offer window closed"));
+
+    // A user who scanned the earlier request can still pay late. Once a wallet's expiry
+    // passes the deadline, a payment included before the deadline still breaks the rule.
+    while expiry_at(env.issuer.tip()) <= inv.deadline_height {
+        env.issuer.mine(1);
+    }
+    let included = env.issuer.pay(pid, None, None).unwrap();
+    assert!(included <= inv.deadline_height);
+    env.issuer.mine(5);
+    let v = b.status(None).unwrap().remove(0);
+    assert_eq!(v.last_status.as_deref(), Some("NeedsReconciliation"));
+    assert_eq!(v.stage, Stage::Invoiced);
+    assert_eq!(env.node.installed_count(), 0);
+}
+
+#[test]
+fn malformed_invoice_answer_keeps_the_request_for_retry() {
+    let env = env("malformed-answer");
+    env.node.set_tamper(Tamper::MalformedInvoiceAnswer);
+    let mut b = open(&env);
+    let err = b.buy(SERVICE).unwrap_err();
+    assert!(
+        matches!(&err, BridgeError::Retryable(m) if m.contains("malformed invoice answer")),
+        "{err}"
+    );
+    assert_eq!(b.state().purchases[0].stage, Stage::Requested);
+    assert_eq!(env.issuer.invoices_created(), 1, "the provider recorded it");
+    let request_id = b.state().purchases[0].request_id.clone();
+
+    env.node.set_tamper(Tamper::None);
+    let v = b.resume().unwrap().remove(0);
+    assert_eq!(v.stage, Stage::Invoiced);
+    assert_eq!(v.request_id, request_id);
+    assert_eq!(env.issuer.invoices_created(), 1);
+    offered(&v);
 }
 
 const REQUEST_INVOICE: &str = "paidstream_requestinvoice";

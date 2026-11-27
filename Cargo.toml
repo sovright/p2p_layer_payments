@@ -19,6 +19,8 @@ zcash_address = "0.14"
 zcash_protocol = "0.11"
 # Already a dependency of zip321; used for base64url memos and the HTTP Basic cookie header.
 base64 = "0.22"
+# OS randomness for request ids and mock cookies.
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [profile.dev]
 debug = 0

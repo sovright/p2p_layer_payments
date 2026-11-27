@@ -6,18 +6,18 @@
 //! derives a grant or a payment from a local txid, a user statement or the node's chain RPC.
 
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::VerifyingKey;
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::checks::{self, Expectations};
 use crate::codec::{self, Invoice, Network};
 use crate::contract;
+use crate::expiry::{self, WalletExpiryProfile};
 use crate::hexutil;
 use crate::rpc::{RpcClient, RpcError};
 use crate::state::{Install, Purchase, Stage, StateError, StateFile, StateStore};
@@ -40,6 +40,11 @@ pub struct Config {
     pub provider_node_id: String,
     pub issuer_public_key: String,
     pub purchase_limit_zat: u64,
+    /// The wallet expiry profile used for the offer window (see `expiry`).
+    pub wallet_expiry_profile: String,
+    /// Blocks kept free between the expected wallet expiry and the deadline. A configured
+    /// value, not a recommendation.
+    pub offer_margin_blocks: u32,
 }
 
 impl Config {
@@ -136,6 +141,8 @@ pub enum PaymentRequest {
         uri: String,
         amount_zat: u64,
         deadline_height: u32,
+        /// The `nExpiryHeight` a wallet following the configured profile would set now.
+        expected_expiry: u32,
         /// Shown again for an invoice that was already shown once.
         reshown: bool,
     },
@@ -154,9 +161,10 @@ pub struct PurchaseView {
     pub note: Option<String>,
 }
 
-pub fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+/// Random bytes from the operating system's generator.
+pub fn random_bytes<const N: usize>() -> Result<[u8; N], rand_core::Error> {
     let mut out = [0u8; N];
-    File::open("/dev/urandom")?.read_exact(&mut out)?;
+    OsRng.try_fill_bytes(&mut out)?;
     Ok(out)
 }
 
@@ -169,6 +177,7 @@ pub struct Bridge {
     state: StateFile,
     node_id: Option<[u8; 32]>,
     crash: Option<CrashPoint>,
+    profile: WalletExpiryProfile,
 }
 
 impl Bridge {
@@ -182,6 +191,17 @@ impl Bridge {
             .map_err(|e| BridgeError::Config(format!("provider_node_id: {e}")))?;
         let rpc = RpcClient::from_cookie_file(cfg.node_rpc, &cfg.cookie_file)
             .map_err(BridgeError::Config)?;
+        let profile = expiry::profile_by_name(&cfg.wallet_expiry_profile).ok_or_else(|| {
+            BridgeError::Config(format!(
+                "unknown wallet_expiry_profile {:?}; known: {}",
+                cfg.wallet_expiry_profile,
+                expiry::PROFILES
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
         let (store, state) = StateStore::open(&cfg.state_file)?;
         Ok(Bridge {
             cfg,
@@ -192,6 +212,7 @@ impl Bridge {
             state,
             node_id: None,
             crash: None,
+            profile,
         })
     }
 
@@ -349,7 +370,7 @@ impl Bridge {
             };
         }
         let request_id = random_bytes::<16>()
-            .map_err(|e| BridgeError::Config(format!("cannot read /dev/urandom: {e}")))?;
+            .map_err(|e| BridgeError::Config(format!("the OS random generator failed: {e}")))?;
         self.state.purchases.push(Purchase {
             request_id: hexutil::encode(&request_id),
             service: service.to_string(),
@@ -422,7 +443,16 @@ impl Bridge {
             });
         let (purchase_id, invoice_bytes) = match parsed {
             Ok(x) => x,
-            Err(e) => return self.reject(idx, format!("malformed invoice answer: {e}")),
+            Err(e) => {
+                // The provider may already hold an invoice for this request_id, so a garbled
+                // answer is retried like a lost one rather than ending the purchase.
+                let msg = format!(
+                    "malformed invoice answer ({e}). The purchase and its request_id are kept; \
+                     run `resume` or `buy` again to retry the same request"
+                );
+                self.set_note(idx, Some(msg.clone()))?;
+                return Err(BridgeError::Retryable(msg));
+            }
         };
         let inv = match codec::verify_invoice(&invoice_bytes, &self.issuer_key) {
             Ok(inv) => inv,
@@ -478,6 +508,13 @@ impl Bridge {
             self.state.purchases[idx].last_status = Some(status.clone());
             self.persist(None)?;
         }
+        if status == "PaymentSeen" {
+            return Ok(self.withheld(
+                idx,
+                "the provider has seen a payment that is still short of its confirmations; \
+                 no payment request shown. Run `status` to follow it",
+            ));
+        }
         if status != "Pending" {
             return Ok(self.withheld(
                 idx,
@@ -488,16 +525,11 @@ impl Bridge {
             .rpc
             .call("getblockcount", json!([]))
             .ok()
-            .and_then(|v| v.as_u64());
-        let payment = match tip {
-            None => PaymentRequest::Withheld(
-                "could not read the node's chain height; no payment request shown".into(),
-            ),
-            Some(t) if t >= u64::from(inv.deadline_height) => PaymentRequest::Withheld(format!(
-                "the node's chain height {t} has reached the deadline height {}; no payment request shown",
-                inv.deadline_height
-            )),
-            Some(_) => {
+            .and_then(|v| v.as_u64())
+            .and_then(|t| u32::try_from(t).ok());
+        let payment = match self.offer_window(&inv, tip) {
+            Err(reason) => PaymentRequest::Withheld(reason),
+            Ok(expected_expiry) => {
                 let request = uri::build_payment_uri(&inv);
                 uri::verify_payment_uri(&request, &inv, self.cfg.network)
                     .map_err(BridgeError::Rejected)?;
@@ -505,11 +537,38 @@ impl Bridge {
                     uri: request,
                     amount_zat: inv.amount_zat,
                     deadline_height: inv.deadline_height,
+                    expected_expiry,
                     reshown,
                 }
             }
         };
         Ok(self.view(idx, Some(payment)))
+    }
+
+    /// The offer window: a request is offered only while a wallet following the configured
+    /// profile would set an expiry that, with the margin, stays at or below the deadline.
+    /// Returns that expected expiry. This narrows when the request is shown; it does not stop
+    /// a user from paying later, so a late payment can still miss the deadline rule.
+    fn offer_window(&self, inv: &Invoice, tip: Option<u32>) -> Result<u32, String> {
+        let tip = tip.ok_or("could not read the node's chain height; no payment request shown")?;
+        let expiry = self
+            .profile
+            .expiry_for_tip(self.cfg.network, tip)
+            .ok_or_else(|| {
+                format!(
+                    "the expiry profile {} has no upgrade schedule for this network; no payment request shown",
+                    self.profile.name
+                )
+            })?;
+        let latest = expiry.saturating_add(self.cfg.offer_margin_blocks);
+        if latest > inv.deadline_height {
+            return Err(format!(
+                "offer window closed: at tip {tip} a wallet following {} would set nExpiryHeight {expiry}, \
+                 and with the margin of {} blocks that passes the deadline {}; no payment request shown",
+                self.profile.name, self.cfg.offer_margin_blocks, inv.deadline_height
+            ));
+        }
+        Ok(expiry)
     }
 
     /// Asks the provider (through the node) for the status of open purchases.
@@ -604,7 +663,7 @@ impl Bridge {
                 self.set_note(idx, None)?;
                 Ok(self.view(idx, None))
             }
-            ("Pending" | "Underpaid" | "NeedsReconciliation" | "NotFound", _) => {
+            ("Pending" | "PaymentSeen" | "Underpaid" | "NeedsReconciliation" | "NotFound", _) => {
                 self.persist(None)?;
                 Ok(self.view(idx, None))
             }
