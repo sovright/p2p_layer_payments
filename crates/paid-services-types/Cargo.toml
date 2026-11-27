@@ -1,0 +1,22 @@
+[package]
+name = "paid-services-types"
+description = "Sync-only types for paid services over Zakura P2P: signed invoices and grants, checks, contract codes, payment requests and RPC bodies. No I/O."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+ed25519-zebra.workspace = true
+hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+zcash_address.workspace = true
+zcash_protocol.workspace = true
+zip321.workspace = true
+
+[lints]
+workspace = true

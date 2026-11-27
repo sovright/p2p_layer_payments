@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/paid-services-types",
+    "crates/paid-services-sidecar",
+    "crates/paid-services-mock",
+    "crates/paid-services-relay",
+]
+
+# Settings follow zakura-core/zakura (main cb148173) so the crates can move into that tree.
+[workspace.package]
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sovright/p2p_layer_payments"
+rust-version = "1.97"
+edition = "2021"
+publish = false
+
+# Versions follow Zakura's [workspace.dependencies]; the Zcash crates are Zakura's forks,
+# renamed the same way Zakura's Cargo.toml renames them.
+[workspace.dependencies]
+paid-services-mock = { path = "crates/paid-services-mock" }
+paid-services-relay = { path = "crates/paid-services-relay" }
+paid-services-types = { path = "crates/paid-services-types" }
+
+base64 = "0.22.1"
+clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context"] }
+ed25519-zebra = "4.2"
+hex = "0.4.3"
+# Not in Zakura's tree: renders the payment request as a terminal QR code. Only the
+# unicode renderer is used, with no default features (no image dependency).
+qrcode = { version = "0.13", default-features = false }
+rand_core = "0.6"
+serde = "1.0.219"
+serde_json = "1.0.140"
+thiserror = "2.0"
+zcash_address = { version = "=5.4.0", package = "zakura-address", default-features = false, features = ["std"] }
+zcash_protocol = { version = "=5.4.0", package = "zakura-protocol", default-features = false, features = ["std"] }
+# Not in Zakura's tree yet: Zakura's own fork of zip321 (zakura-core/common), built on the
+# forked address crates above.
+zip321 = { version = "=5.4.0", package = "zakura-zip321" }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+# Copied from Zakura's [workspace.lints] (main cb148173).
+[workspace.lints.rust]
+# The linter should ignore these expected config flags/values
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zakura and librustzcash
+    'cfg(zakura_sim)', # The deterministic P2P simulator build of zakura-rt
+] }
+
+# High-risk code
+unsafe_code = "deny"
+non_ascii_idents = "deny"
+
+# Compatibility
+rust_2021_compatibility = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
+future_incompatible = { level = "warn", priority = -1 }
+
+# Documentation
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Async code
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+
+# Pointers
+cast_ptr_alignment = "warn"
+fn_to_numeric_cast_any = "warn"
+
+# Integers
+checked_conversions = "warn"
+implicit_saturating_sub = "warn"
+invalid_upcast_comparisons = "warn"
+range_minus_one = "warn"
+range_plus_one = "warn"
+unnecessary_cast = "warn"
+
+# Incomplete code
+dbg_macro = "warn"
+todo = "warn"
+
+# Manual debugging output — use tracing::trace!() or tracing::debug!() instead
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Code styles we want to accept
+try_err = "allow"
+
+# Clippy 1.99 reports these in code that `derive-new`, `thiserror` and `tonic`
+# generate, which we can't change.
+double_must_use = "allow"
+redundant_field_names = "allow"
+
+# Panics
+fallible_impl_from = "warn"
+unwrap_in_result = "warn"
+
+# TODOs: fix this lint eventually
+result_large_err = "allow"

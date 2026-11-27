@@ -1,0 +1,15 @@
+[package]
+name = "paid-services-relay"
+description = "The relay block stream as a paid service: its service kind, parameters and sidecar adapter. No I/O."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+paid-services-types.workspace = true
+
+[lints]
+workspace = true
