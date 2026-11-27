@@ -18,7 +18,7 @@ A user who pays from their own wallet chooses the transaction's `nExpiryHeight`;
 ## Options for each case
 
 **A. In time, expiry misses the rule.** The money arrived in time; only the transaction's expiry field breaks the rule.
-- *Option A1, grant anyway:* a payment included by the deadline qualifies whatever its expiry. This drops the expiry condition, which is the "C" choice discussed in the bridge plan, and lets late payments in, because the expiry was the guard against inclusion after the deadline. The issuer still checks the inclusion height, so case B stays separate.
+- *Option A1, grant anyway:* a payment included by the deadline qualifies whatever its expiry. This drops the `nExpiryHeight` condition, which is the "C" choice discussed in the bridge plan. It does not give access to a payment included after the deadline, as long as the issuer keeps checking the inclusion height against the deadline. What A1 gives up is the on-chain guarantee: under the expiry condition, a qualifying transaction cannot be mined after the deadline at all. Without it, a payment can still be included late, and that payment falls under case B. The provider's rule for refusing late payments is a separate decision.
 - *Option A2, keep the rule:* treat as case B.
 
 **B. Late payment.**
@@ -36,7 +36,11 @@ A user who pays from their own wallet chooses the transaction's `nExpiryHeight`;
 ## What a refund needs
 
 A refund is not a small addition:
-- **A refund address.** A shielded payment does not reveal where it came from, so the buyer must give an address in advance. That means a field in the invoice request, which links the purchase to an address the buyer controls. This has a privacy cost, and the buyer may not want to share an address at all.
+- **A refund address.** A shielded payment does not reveal where it came from, so the buyer has to supply an address. There are two options:
+  - collect it in advance, as a field in the invoice request;
+  - collect it later, through an authenticated request tied to the purchase.
+
+  Either way, the purchase is linked to an address the buyer controls. That has a privacy cost, and the buyer may not want to share an address at all. Neither option is implemented, and this prototype has not chosen one.
 - **Fees.** Who pays the refund transaction's fee, and whether small amounts are refunded at all, below some dust limit.
 - **Its own idempotency.** A refund is a payment with the same lost-answer and retry problems as the original: a refund id, a durable record, and no second refund after a lost answer.
 - **Timing and finality.** When a refund is due: after N confirmations of the original, after the deadline, or after the grace window.
@@ -45,7 +49,7 @@ A refund is not a small addition:
 ## A possible starting rule, for discussion
 
 These are suggestions for the first real deployment, not decisions:
-- **A:** grant (A1) only if the provider accepts a slightly late inclusion risk; otherwise manual reconciliation.
+- **A:** grant (A1) only if the provider accepts the risk of late inclusion; otherwise manual reconciliation. Without the expiry rule, nothing limits how late a payment can be included: a transaction with `nExpiryHeight` 0 never expires. A payment included late still falls under case B.
 - **B:** a short grace window (B1), then manual reconciliation (B3) instead of automatic refunds.
 - **C:** manual reconciliation (C3).
 - **D:** manual reconciliation.
