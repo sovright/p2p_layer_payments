@@ -11,6 +11,7 @@
 //! redeemed.
 
 use std::path::Path;
+use std::time::Duration;
 
 use paid_services_relay::RelayAdapter;
 use paid_services_types::checks::{self, Expectations};
@@ -243,6 +244,11 @@ impl Bridge {
         self.crash = point;
     }
 
+    /// Test hook: another total time limit for each node call.
+    pub fn set_rpc_timeout(&mut self, timeout: Duration) {
+        self.rpc = self.rpc.clone().with_timeout(timeout);
+    }
+
     /// The loaded state.
     pub fn state(&self) -> &StateFile {
         &self.state
@@ -377,7 +383,8 @@ impl Bridge {
         }
     }
 
-    /// Re-verifies the stored invoice, so an edited state file can never yield a payment request.
+    /// Re-verifies the stored invoice's signature. Before a payment request is shown,
+    /// `recheck_invoice` also runs the receipt checks again.
     fn stored_invoice(&self, idx: usize) -> Result<Invoice, BridgeError> {
         let hex = self.state.purchases[idx]
             .invoice
@@ -543,10 +550,52 @@ impl Bridge {
         self.present(idx, false)
     }
 
-    /// Offers the payment request only while the provider still reports the purchase as
-    /// pending and the offer window is open. Otherwise it is withheld.
+    /// Runs the receipt checks again on a stored invoice before a payment request is shown:
+    /// the current network, issuer, provider and client NodeId, the purchase's service kind,
+    /// offer and purchase_id, the current purchase limit and the service adapter. A failure
+    /// only withholds the request. The purchase is not changed, so a grant for it can still
+    /// be fetched and redeemed.
+    fn recheck_invoice(&mut self, idx: usize, inv: &Invoice) -> Result<(), String> {
+        let (service_kind, offer_id, purchase_id) = {
+            let p = &self.state.purchases[idx];
+            let pid = p
+                .purchase_id
+                .as_deref()
+                .ok_or_else(|| "the purchase has no purchase_id".to_string())?;
+            (
+                p.service_kind.clone(),
+                p.offer_id.clone(),
+                hex_array::<16>(pid)?,
+            )
+        };
+        let exp = self.expectations().map_err(|e| e.to_string())?;
+        let adapter = self.adapter(idx).map_err(|e| e.to_string())?;
+        checks::check_invoice(
+            inv,
+            &exp,
+            &service_kind,
+            &offer_id,
+            &purchase_id,
+            self.cfg.purchase_limit_zat,
+        )
+        .map_err(|e| e.to_string())?;
+        adapter.check_invoice(inv)
+    }
+
+    /// Offers the payment request only while the stored invoice still passes the receipt
+    /// checks, the provider still reports the purchase as pending and the offer window is
+    /// open. Otherwise it is withheld.
     fn present(&mut self, idx: usize, reshown: bool) -> Result<PurchaseView, BridgeError> {
         let inv = self.stored_invoice(idx)?;
+        if let Err(reason) = self.recheck_invoice(idx, &inv) {
+            return Ok(self.withheld(
+                idx,
+                format!(
+                    "the stored invoice was not confirmed against the current configuration \
+                     ({reason}); no payment request shown"
+                ),
+            ));
+        }
         let pid = self.state.purchases[idx]
             .purchase_id
             .clone()

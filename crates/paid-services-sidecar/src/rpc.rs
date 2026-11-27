@@ -4,11 +4,16 @@
 //! as Zakura's admin listener requires. A request that gets no answer is reported as
 //! [`RpcError::Transport`]: the outcome is unknown, and the caller must retry the same request
 //! rather than start a new one.
+//!
+//! Each call has one deadline, measured on a monotonic clock. Connecting, writing the request
+//! and reading the answer's header and body all spend the same budget. Each I/O step gets only
+//! the time that is left, so a peer that sends one byte at a time cannot stretch the call. All
+//! I/O runs on the calling thread, and nothing keeps running after a call returns.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
@@ -17,6 +22,8 @@ use serde_json::{json, Value};
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Largest HTTP body accepted.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Total time one call may take, from connecting to the last byte of the answer.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why a node call failed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -60,8 +67,15 @@ impl RpcClient {
         Ok(RpcClient {
             addr,
             auth_header: format!("Basic {}", STANDARD.encode(cookie)),
-            timeout: Duration::from_secs(10),
+            timeout: DEFAULT_CALL_TIMEOUT,
         })
+    }
+
+    /// The same client with another total time limit per call. A call that does not finish
+    /// within it fails with [`RpcError::Transport`]: the outcome is unknown.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// A client that reads its cookie from a file.
@@ -81,13 +95,18 @@ impl RpcClient {
         let body =
             json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
         let transport = |e: io::Error| RpcError::Transport(e.to_string());
-        let mut stream = TcpStream::connect_timeout(&self.addr, self.timeout).map_err(transport)?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(transport)?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(transport)?;
+        let deadline = Deadline::start(self.timeout);
+        let tcp = TcpStream::connect_timeout(&self.addr, deadline.remaining().map_err(transport)?)
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                    transport(deadline.expired())
+                }
+                _ => transport(e),
+            })?;
+        let mut stream = DeadlineStream {
+            stream: &tcp,
+            deadline,
+        };
         let request = format!(
             "POST / HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.addr,
@@ -132,6 +151,72 @@ impl RpcClient {
             .get("result")
             .cloned()
             .ok_or_else(|| RpcError::Protocol("response has no result".into()))
+    }
+}
+
+/// The one deadline of a call, on a monotonic clock.
+#[derive(Clone, Copy)]
+struct Deadline {
+    start: Instant,
+    total: Duration,
+}
+
+impl Deadline {
+    fn start(total: Duration) -> Self {
+        Deadline {
+            start: Instant::now(),
+            total,
+        }
+    }
+
+    /// The time left, or a `TimedOut` error once none is left.
+    fn remaining(&self) -> io::Result<Duration> {
+        match self.total.checked_sub(self.start.elapsed()) {
+            Some(left) if !left.is_zero() => Ok(left),
+            _ => Err(self.expired()),
+        }
+    }
+
+    fn expired(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no complete answer within {} ms", self.total.as_millis()),
+        )
+    }
+}
+
+/// A stream whose every read and write gets only the time left before the deadline.
+struct DeadlineStream<'a> {
+    stream: &'a TcpStream,
+    deadline: Deadline,
+}
+
+impl DeadlineStream<'_> {
+    fn timed_out(&self, e: io::Error) -> io::Error {
+        match e.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => self.deadline.expired(),
+            _ => e,
+        }
+    }
+}
+
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream
+            .set_read_timeout(Some(self.deadline.remaining()?))?;
+        self.stream.read(buf).map_err(|e| self.timed_out(e))
+    }
+}
+
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream
+            .set_write_timeout(Some(self.deadline.remaining()?))?;
+        self.stream.write(buf).map_err(|e| self.timed_out(e))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 

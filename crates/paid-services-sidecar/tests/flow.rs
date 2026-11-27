@@ -97,6 +97,25 @@ fn open(env: &Env) -> Bridge {
     Bridge::open(env.cfg.clone()).unwrap()
 }
 
+/// Opens the bridge again after an earlier one on the same state was dropped. Reacquiring the
+/// lock can fail briefly while other tests spawn processes (see
+/// `a_second_process_on_the_same_state_is_locked_out`; the cause is an unverified hypothesis),
+/// so only `Locked` is retried, within a fixed bound.
+fn reopen(env: &Env) -> Bridge {
+    let start = Instant::now();
+    loop {
+        match Bridge::open(env.cfg.clone()) {
+            Ok(b) => return b,
+            Err(BridgeError::State(StateError::Locked(_)))
+                if start.elapsed() < Duration::from_secs(5) =>
+            {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(e) => panic!("the bridge did not open again: {e}"),
+        }
+    }
+}
+
 fn offered(v: &PurchaseView) -> (String, bool) {
     match &v.payment {
         Some(PaymentRequest::Offered { uri, reshown, .. }) => (uri.clone(), *reshown),
@@ -497,6 +516,101 @@ fn invoice_above_the_purchase_limit_is_rejected() {
         other => panic!("{other}"),
     }
     assert_eq!(b.state().purchases[0].stage, Stage::Rejected);
+}
+
+#[test]
+fn a_valid_stored_invoice_is_shown_again_after_a_restart() {
+    let env = env("reshow");
+    let pid = {
+        let mut b = open(&env);
+        let v = b.buy(KIND, OFFER).unwrap();
+        offered(&v);
+        pid_of(&v)
+    };
+    let mut b = reopen(&env);
+    let (request, reshown) = offered(&b.show(&hex::encode(pid)).unwrap());
+    assert!(reshown);
+    assert_eq!(request, uri::build_payment_uri(&invoice_of(&env, pid)));
+}
+
+#[test]
+fn a_lowered_limit_withholds_the_stored_request_without_rejecting_it() {
+    let mut env = env("lowered-limit");
+    let pid = {
+        let mut b = open(&env);
+        pid_of(&b.buy(KIND, OFFER).unwrap())
+    };
+    let amount = invoice_of(&env, pid).amount_zat;
+
+    env.cfg.purchase_limit_zat = amount - 1;
+    {
+        let mut b = reopen(&env);
+        let shown = b.show(&hex::encode(pid)).unwrap();
+        let again = b.buy(KIND, OFFER).unwrap();
+        let resumed = b.resume().unwrap().remove(0);
+        for v in [shown, again, resumed] {
+            let reason = withheld(&v);
+            assert!(reason.contains("purchase limit"), "{reason}");
+            assert_eq!(v.stage, Stage::Invoiced);
+        }
+        assert_eq!(b.state().purchases.len(), 1);
+    }
+    assert_eq!(stage_on_disk(&env.cfg.state_file), "invoiced");
+    assert_eq!(env.issuer.invoices_created(), 1);
+
+    // The purchase was not rejected: with the limit back, the same request is shown again.
+    env.cfg.purchase_limit_zat = amount;
+    let mut b = reopen(&env);
+    offered(&b.show(&hex::encode(pid)).unwrap());
+}
+
+#[test]
+fn a_substituted_invoice_from_the_same_issuer_is_never_shown() {
+    for (name, other_offer, expected) in [
+        ("other-offer", "relay-20", "is for service"),
+        ("other-purchase", OFFER, "purchase_id differs"),
+    ] {
+        let env = env(&format!("substituted-{name}"));
+        let pid = {
+            let mut b = open(&env);
+            pid_of(&b.buy(KIND, OFFER).unwrap())
+        };
+        // Another invoice the same issuer signed for this client, written into the state file.
+        let (other_pid, other_bytes) = env
+            .issuer
+            .request_invoice(TEST_CLIENT_NODE_ID, KIND, other_offer, [0x5a; 16])
+            .unwrap();
+        assert_ne!(other_pid, pid);
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&env.cfg.state_file).unwrap()).unwrap();
+        state["purchases"][0]["invoice"] = json!(hex::encode(&other_bytes));
+        std::fs::write(&env.cfg.state_file, state.to_string()).unwrap();
+
+        let mut b = reopen(&env);
+        let v = b.show(&hex::encode(pid)).unwrap();
+        let reason = withheld(&v);
+        assert!(reason.contains(expected), "{name}: {reason}");
+        assert_eq!(v.stage, Stage::Invoiced, "{name}");
+    }
+}
+
+#[test]
+fn a_lowered_limit_does_not_block_recovering_an_issued_grant() {
+    let mut env = env("lowered-limit-grant");
+    let pid = {
+        let mut b = open(&env);
+        pid_of(&b.buy(KIND, OFFER).unwrap())
+    };
+    pay_and_confirm(&env, pid);
+
+    env.cfg.purchase_limit_zat = 1;
+    let mut b = reopen(&env);
+    let v = b.resume().unwrap().remove(0);
+    assert_eq!(v.stage, Stage::Redeemed);
+    assert_eq!(
+        env.node.installed(pid).unwrap(),
+        env.issuer.grant_bytes(pid).unwrap()
+    );
 }
 
 #[test]
